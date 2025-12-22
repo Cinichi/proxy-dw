@@ -1,5 +1,7 @@
+
 // Enhanced Proxy with Google Drive Support + Range Polyfill & Stream Splitting
 // Improvements: Direct Google Drive integration, iOS playback fix, prevents OOM, referer spoofing
+// Version: 1.1 - Fixed uuid, HEAD handling, cache normalization
 
 export default {
   async fetch(request, env, ctx) {
@@ -27,14 +29,22 @@ async function handleRequest(request, env, ctx) {
 
   // Handle Google Drive file ID directly
   if (fileId && !targetUrl) {
-    targetUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+    targetUrl = `https://drive.usercontent.google.com/download` +
+                `?id=${fileId}` +
+                `&export=download` +
+                `&confirm=t` +
+                `&uuid=${crypto.randomUUID()}`;
   }
 
   // Handle Google Drive share URLs
   if (targetUrl && targetUrl.includes('drive.google.com')) {
     const extractedId = extractGoogleDriveId(targetUrl);
     if (extractedId) {
-      targetUrl = `https://drive.usercontent.google.com/download?id=${extractedId}&export=download&confirm=t`;
+      targetUrl = `https://drive.usercontent.google.com/download` +
+                  `?id=${extractedId}` +
+                  `&export=download` +
+                  `&confirm=t` +
+                  `&uuid=${crypto.randomUUID()}`;
     }
   }
 
@@ -60,7 +70,7 @@ async function handleRequest(request, env, ctx) {
   const rangeHeader = request.headers.get('Range');
 
   // 1. Try Cache (Only for non-range requests)
-  if (!rangeHeader) {
+  if (!rangeHeader && request.method === 'GET') {
     const cached = await getCachedResponse(cache, targetUrl, request);
     if (cached) return cached;
   }
@@ -90,6 +100,20 @@ function extractGoogleDriveId(url) {
 async function fetchAndStream(request, targetUrl, parsedTarget, cache, ctx, rangeHeader, params) {
   const proxyHeaders = buildProxyHeaders(request, parsedTarget, params);
   
+  // FIX #2: Handle HEAD requests separately to avoid body issues
+  if (request.method === 'HEAD') {
+    const headResp = await fetch(targetUrl, {
+      method: 'HEAD',
+      headers: proxyHeaders,
+      redirect: 'follow'
+    });
+
+    return new Response(null, {
+      status: headResp.status,
+      headers: buildResponseHeaders(headResp, null)
+    });
+  }
+
   // For Google Drive, add special handling
   if (targetUrl.includes('drive.usercontent.google.com') || targetUrl.includes('drive.google.com')) {
     proxyHeaders.set('Cookie', ''); // Clear cookies for direct download
@@ -115,7 +139,7 @@ async function fetchAndStream(request, targetUrl, parsedTarget, cache, ctx, rang
 
   // 3. THE IOS FIX: Polyfill Range Requests
   // If client sent "Range" but server sent "200 OK", we must slice it manually.
-  if (rangeHeader && response.status === 200) {
+  if (rangeHeader && response.status === 200 && response.body) {
     const parts = rangeHeader.replace(/bytes=/, "").split("-");
     const totalLength = parseInt(response.headers.get('Content-Length') || "0", 10);
     const start = parseInt(parts[0], 10);
@@ -127,13 +151,11 @@ async function fetchAndStream(request, targetUrl, parsedTarget, cache, ctx, rang
       finalHeaders.set('Content-Length', String(end - start + 1));
       
       // We pipe the body through a slicer
-      if (response.body) {
-        finalResponse = new Response(response.body.pipeThrough(createSliceStream(start, end)), {
-          status: 206,
-          statusText: 'Partial Content',
-          headers: finalHeaders
-        });
-      }
+      finalResponse = new Response(response.body.pipeThrough(createSliceStream(start, end)), {
+        status: 206,
+        statusText: 'Partial Content',
+        headers: finalHeaders
+      });
     }
   } else {
     // Reconstruct response with new headers
@@ -147,6 +169,11 @@ async function fetchAndStream(request, targetUrl, parsedTarget, cache, ctx, rang
   // 4. Memory-Safe Caching (Using Tee)
   // We only cache full 200 OK responses, never partials or manual slices
   if (!rangeHeader && response.status === 200 && finalResponse.body) {
+    // FIX #3: Normalize cache key to remove uuid for Drive URLs
+    const cacheKey = targetUrl.includes('drive.usercontent.google.com')
+      ? targetUrl.replace(/&uuid=[^&]+/, '')
+      : targetUrl;
+
     // split the stream: body1 goes to cache, body2 goes to user
     const [body1, body2] = finalResponse.body.tee();
     
@@ -156,7 +183,7 @@ async function fetchAndStream(request, targetUrl, parsedTarget, cache, ctx, rang
       headers: finalHeaders
     });
     
-    ctx.waitUntil(cache.put(new Request(targetUrl, { method: 'GET' }), responseToCache));
+    ctx.waitUntil(cache.put(new Request(cacheKey, { method: 'GET' }), responseToCache));
 
     // Return the second stream to the user
     return new Response(body2, {
@@ -262,8 +289,12 @@ function validateTargetUrl(targetUrl, env) {
 }
 
 async function getCachedResponse(cache, targetUrl, request) {
-  // Simple cache match for non-range requests
-  const response = await cache.match(new Request(targetUrl, { method: 'GET' }));
+  // FIX #3: Normalize cache key when checking cache too
+  const cacheKey = targetUrl.includes('drive.usercontent.google.com')
+    ? targetUrl.replace(/&uuid=[^&]+/, '')
+    : targetUrl;
+
+  const response = await cache.match(new Request(cacheKey, { method: 'GET' }));
   if (!response) return null;
 
   const headers = new Headers(response.headers);
