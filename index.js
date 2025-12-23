@@ -1,5 +1,5 @@
-// Google Drive Proxy v3.1 - Multi-Account + Proper Filename/Size Headers
-// Features: Multiple service accounts, proper Content-Disposition, Content-Length
+// Google Drive Proxy v3.1 - Multi-Account + Speed Optimized + Proper Headers
+// Copy this ENTIRE code to Cloudflare Worker
 
 export default {
   async fetch(request, env, ctx) {
@@ -25,9 +25,8 @@ async function handleRequest(request, env, ctx) {
   let targetUrl = url.searchParams.get('url');
   const fileId = url.searchParams.get('id');
   const forceApi = url.searchParams.get('api') === 'true';
-  const debug = url.searchParams.get('debug') === 'true'; // Debug mode
+  const debug = url.searchParams.get('debug') === 'true';
   
-  // Extract file ID
   let extractedFileId = fileId;
   if (!extractedFileId && targetUrl) {
     if (targetUrl.includes('drive.google.com')) {
@@ -39,7 +38,7 @@ async function handleRequest(request, env, ctx) {
     return jsonResponse({ 
       error: 'Missing url or id parameter', 
       examples: {
-        driveId: '?id=1QQ_v5rA0W_QP8oPSqKq2tmyy66QhZJh0',
+        driveId: '?id=FILE_ID',
         driveIdApi: '?id=FILE_ID&api=true',
         driveUrl: '?url=https://drive.google.com/file/d/ID/view',
         directUrl: '?url=https://example.com/video.mp4'
@@ -47,25 +46,21 @@ async function handleRequest(request, env, ctx) {
     }, 400);
   }
 
-  // Try API first if we have credentials and a file ID
   if (extractedFileId && (forceApi || hasServiceAccounts(env))) {
     try {
       const result = await handleDriveApiRequest(request, extractedFileId, env, ctx, debug);
       return result;
     } catch (apiError) {
-      console.warn('Drive API failed, falling back:', apiError.message);
+      console.warn('Drive API failed:', apiError.message);
       if (debug) {
         return jsonResponse({
           error: 'API failed',
-          details: apiError.message,
-          fallback: 'Will try direct download'
+          details: apiError.message
         }, 500);
       }
-      // Fall through to direct download
     }
   }
 
-  // Build target URL for direct download
   if (extractedFileId && !targetUrl) {
     targetUrl = buildGoogleDriveUrl(extractedFileId);
   }
@@ -90,40 +85,27 @@ async function handleRequest(request, env, ctx) {
   return await fetchOptimized(request, targetUrl, validation.url, cache, ctx, rangeHeader, url.searchParams);
 }
 
-/**
- * Check if any service accounts are configured
- */
 function hasServiceAccounts(env) {
   return env.GOOGLE_SERVICE_ACCOUNT || 
          env.GOOGLE_SERVICE_ACCOUNT_1 || 
-         env.GOOGLE_SERVICE_ACCOUNT_2 || 
-         env.GOOGLE_SERVICE_ACCOUNT_3;
+         env.GOOGLE_SERVICE_ACCOUNT_2;
 }
 
-/**
- * Get all configured service accounts
- */
 function getAllServiceAccounts(env) {
   const accounts = [];
-  
-  // Support multiple service accounts (up to 10)
   for (let i = 0; i <= 10; i++) {
     const key = i === 0 ? 'GOOGLE_SERVICE_ACCOUNT' : `GOOGLE_SERVICE_ACCOUNT_${i}`;
     if (env[key]) {
       try {
         accounts.push(JSON.parse(env[key]));
       } catch (e) {
-        console.error(`Invalid JSON in ${key}:`, e);
+        console.error(`Invalid JSON in ${key}`);
       }
     }
   }
-  
   return accounts;
 }
 
-/**
- * Handle request using Google Drive API with multi-account support
- */
 async function handleDriveApiRequest(request, fileId, env, ctx, debug = false) {
   const serviceAccounts = getAllServiceAccounts(env);
   
@@ -132,46 +114,31 @@ async function handleDriveApiRequest(request, fileId, env, ctx, debug = false) {
   }
 
   let lastError = null;
-  
-  // Try each service account until one works
   for (let i = 0; i < serviceAccounts.length; i++) {
     try {
       const result = await tryServiceAccount(request, fileId, serviceAccounts[i], i, debug);
       if (result) return result;
     } catch (error) {
-      console.warn(`Service account ${i} failed:`, error.message);
+      console.warn(`Account ${i} failed:`, error.message);
       lastError = error;
-      continue;
     }
   }
-  
-  // All accounts failed
-  throw lastError || new Error('All service accounts failed');
+  throw lastError || new Error('All accounts failed');
 }
 
-/**
- * Try downloading with a specific service account
- */
 async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, debug = false) {
   const accessToken = await getGoogleAccessToken(serviceAccount);
-  
-  if (!accessToken) {
-    throw new Error('Failed to get access token');
-  }
+  if (!accessToken) throw new Error('No access token');
 
   const rangeHeader = request.headers.get('Range');
   
-  // Get file metadata first (for filename and size)
   const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType`;
   const metaResp = await fetch(metaUrl, {
     headers: { 'Authorization': `Bearer ${accessToken}` }
   });
   
   if (!metaResp.ok) {
-    if (metaResp.status === 404 || metaResp.status === 403) {
-      throw new Error(`File not accessible with account ${accountIndex}`);
-    }
-    throw new Error(`Metadata fetch failed: ${metaResp.status}`);
+    throw new Error(`Metadata failed: ${metaResp.status}`);
   }
   
   const metadata = await metaResp.json();
@@ -179,120 +146,75 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   const fileSize = metadata.size || '0';
   const mimeType = metadata.mimeType || 'application/octet-stream';
   
-  // Debug logging
-  console.log(`File metadata - Name: ${fileName}, Size: ${fileSize}, Type: ${mimeType}`);
-  
-  // HEAD request - return metadata
   if (request.method === 'HEAD') {
     const headers = new Headers();
     headers.set('Content-Length', fileSize);
     headers.set('Content-Type', mimeType);
-    headers.set('Content-Disposition', `attachment; filename="${encodeFileName(fileName)}"`);
+    headers.set('Content-Disposition', `attachment; filename="${encodeFileName(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
     headers.set('Accept-Ranges', 'bytes');
     headers.set('X-Drive-API', 'true');
-    headers.set('X-Service-Account', String(accountIndex));
     addCorsHeaders(headers);
-    
     return new Response(null, { status: 200, headers });
   }
 
-  // GET request - download file
   const downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
   const downloadHeaders = new Headers({
     'Authorization': `Bearer ${accessToken}`,
-    'Connection': 'keep-alive' // Reuse connections for speed
+    'Connection': 'keep-alive'
   });
   
-  if (rangeHeader) {
-    downloadHeaders.set('Range', rangeHeader);
-  }
+  if (rangeHeader) downloadHeaders.set('Range', rangeHeader);
 
-  const response = await fetch(downloadUrl, {
+  const dlResp = await fetch(downloadUrl, {
     method: 'GET',
     headers: downloadHeaders,
-    // SPEED OPTIMIZATION: Maximize throughput
     cf: {
-      cacheTtl: 14400, // 4 hours cache
+      cacheTtl: 14400,
       cacheEverything: true,
-      polish: 'off', // Disable image optimization
-      mirage: false, // Disable lazy loading
-      minify: { javascript: false, css: false, html: false },
-      apps: false, // Disable Cloudflare Apps
-      scrapeShield: false // Disable extra processing
+      polish: 'off'
     }
-  });const response = await fetch(downloadUrl, {
-    method: 'GET',
-    headers: downloadHeaders
   });
 
-  if (!response.ok) {
-    throw new Error(`Download failed: ${response.status}`);
+  if (!dlResp.ok) {
+    throw new Error(`Download failed: ${dlResp.status}`);
   }
 
   const finalHeaders = new Headers();
-  
-  // CRITICAL: Always set Content-Length from metadata (Google API sometimes doesn't include it)
   finalHeaders.set('Content-Length', fileSize);
   finalHeaders.set('Content-Type', mimeType);
-  
-  // CRITICAL: Proper Content-Disposition for download managers
   finalHeaders.set('Content-Disposition', `attachment; filename="${encodeFileName(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
-  
-  // SPEED: Hint to keep connection alive
   finalHeaders.set('Connection', 'keep-alive');
-  finalHeaders.set('Keep-Alive', 'timeout=300, max=1000');
+  finalHeaders.set('Accept-Ranges', 'bytes');
+  finalHeaders.set('X-Drive-API', 'true');
+  finalHeaders.set('Cache-Control', 'public, max-age=3600');
   
-  // Copy relevant headers from API response
-  if (response.headers.has('ETag')) {
-    finalHeaders.set('ETag', response.headers.get('ETag'));
-  }
-  if (response.headers.has('Last-Modified')) {
-    finalHeaders.set('Last-Modified', response.headers.get('Last-Modified'));
-  }
-  
-  // Handle range responses
-  if (response.status === 206 && response.headers.has('Content-Range')) {
-    finalHeaders.set('Content-Range', response.headers.get('Content-Range'));
-    // For partial content, use actual response length
-    if (response.headers.has('Content-Length')) {
-      finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
+  if (dlResp.status === 206 && dlResp.headers.has('Content-Range')) {
+    finalHeaders.set('Content-Range', dlResp.headers.get('Content-Range'));
+    if (dlResp.headers.has('Content-Length')) {
+      finalHeaders.set('Content-Length', dlResp.headers.get('Content-Length'));
     }
   }
   
-  finalHeaders.set('Accept-Ranges', 'bytes');
-  finalHeaders.set('X-Drive-API', 'true');
-  finalHeaders.set('X-Service-Account', String(accountIndex));
-  finalHeaders.set('Cache-Control', 'public, max-age=3600');
   addCorsHeaders(finalHeaders);
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
+  return new Response(dlResp.body, {
+    status: dlResp.status,
     headers: finalHeaders
   });
 }
 
-/**
- * Encode filename for Content-Disposition header (RFC 5987)
- * Ensures download managers can read filenames properly
- */
 function encodeFileName(fileName) {
-  // Remove or replace problematic characters for basic ASCII filename
   return fileName
-    .replace(/["\\]/g, '') // Remove quotes and backslashes
-    .replace(/[\r\n\t]/g, '') // Remove newlines and tabs
-    .replace(/[^\x20-\x7E]/g, '_') // Replace non-ASCII with underscore
-    .slice(0, 200); // Limit length
+    .replace(/["\\]/g, '')
+    .replace(/[\r\n\t]/g, '')
+    .replace(/[^\x20-\x7E]/g, '_')
+    .slice(0, 200);
 }
 
-/**
- * Get Google OAuth2 access token
- */
 async function getGoogleAccessToken(serviceAccount) {
   try {
     const now = Math.floor(Date.now() / 1000);
     const jwtHeader = { alg: 'RS256', typ: 'JWT' };
-    
     const jwtClaimSet = {
       iss: serviceAccount.client_email,
       scope: 'https://www.googleapis.com/auth/drive.readonly',
@@ -321,14 +243,12 @@ async function getGoogleAccessToken(serviceAccount) {
       body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
     });
     
-    if (!tokenResponse.ok) {
-      throw new Error(`Token exchange failed: ${tokenResponse.status}`);
-    }
+    if (!tokenResponse.ok) return null;
     
     const tokenData = await tokenResponse.json();
     return tokenData.access_token;
   } catch (error) {
-    console.error('Access token error:', error);
+    console.error('Token error:', error);
     return null;
   }
 }
@@ -386,7 +306,6 @@ function deterministicUUID(fileId) {
 function extractGoogleDriveId(url) {
   const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
   if (match) return match[1];
-  
   try {
     return new URL(url).searchParams.get('id');
   } catch {
@@ -403,7 +322,6 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
       headers: proxyHeaders,
       redirect: 'follow'
     });
-    
     return new Response(null, { 
       status: resp.status, 
       headers: buildResponseHeaders(resp, null) 
@@ -414,30 +332,19 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
     method: 'GET',
     headers: proxyHeaders,
     redirect: 'follow',
-    // SPEED: Aggressive caching and no processing
     cf: { 
       cacheTtl: 86400, 
       cacheEverything: true,
-      polish: 'off',
-      mirage: false,
-      apps: false,
-      scrapeShield: false
+      polish: 'off'
     }
   });
 
-  // Detect quota error
   if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
     const text = await response.text();
     if (text.includes("Sorry, you can't view or download")) {
       return jsonResponse({
         error: 'Google Drive quota exceeded',
-        message: 'This file has been downloaded too many times.',
-        solutions: [
-          'Add ?api=true to use API (if configured)',
-          'Configure multiple service accounts for load balancing',
-          'Make a copy to your own Drive',
-          'Wait 24 hours'
-        ]
+        solutions: ['Add ?api=true', 'Wait 24 hours', 'Make a copy']
       }, 429);
     }
   }
@@ -449,30 +356,12 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
 
   const finalHeaders = buildResponseHeaders(response, rangeHeader);
   
-  // CRITICAL FIX: Ensure Content-Length is always present for download managers
-  // Some origins don't include it, breaking progress bars
   if (!finalHeaders.has('Content-Length') && response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
   }
   
-  // FIX: Try to extract filename from Content-Disposition or URL
   if (!finalHeaders.has('Content-Disposition')) {
-    let filename = null;
-    
-    // Try to get from response Content-Disposition first
-    const cd = response.headers.get('Content-Disposition');
-    if (cd) {
-      const match = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-      if (match && match[1]) {
-        filename = match[1].replace(/['"]/g, '');
-      }
-    }
-    
-    // Fallback to URL extraction
-    if (!filename) {
-      filename = extractFilenameFromUrl(targetUrl);
-    }
-    
+    const filename = extractFilenameFromUrl(targetUrl);
     if (filename) {
       finalHeaders.set('Content-Disposition', `attachment; filename="${encodeFileName(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
     }
@@ -499,9 +388,6 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
   return new Response(response.body, { status: response.status, headers: finalHeaders });
 }
 
-/**
- * Extract filename from URL path
- */
 function extractFilenameFromUrl(url) {
   try {
     const pathname = new URL(url).pathname;
@@ -516,9 +402,7 @@ function extractFilenameFromUrl(url) {
 
 function handleRangeRequest(response, rangeHeader, finalHeaders) {
   const rangeMatch = rangeHeader.match(/bytes=(\d*)-(\d*)/);
-  if (!rangeMatch) {
-    return new Response(response.body, { status: 200, headers: finalHeaders });
-  }
+  if (!rangeMatch) return new Response(response.body, { status: 200, headers: finalHeaders });
 
   const [, startStr, endStr] = rangeMatch;
   const start = parseInt(startStr, 10);
@@ -540,7 +424,6 @@ function handleRangeRequest(response, rangeHeader, finalHeaders) {
 
 function createEfficientSliceStream(start, end) {
   let bytesRead = 0;
-  
   return new TransformStream({
     transform(chunk, controller) {
       const chunkStart = bytesRead;
@@ -558,39 +441,25 @@ function createEfficientSliceStream(start, end) {
       
       const sliceStart = Math.max(0, start - chunkStart);
       const sliceEnd = Math.min(chunk.byteLength, end - chunkStart + 1);
-      
       controller.enqueue(chunk.slice(sliceStart, sliceEnd));
       bytesRead += chunk.byteLength;
       
-      if (bytesRead > end) {
-        controller.terminate();
-      }
+      if (bytesRead > end) controller.terminate();
     }
   });
 }
 
 function buildMobileHeaders(request, target, params) {
   const headers = new Headers();
-  
-  const allowedHeaders = ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'];
-  allowedHeaders.forEach(h => {
+  ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'].forEach(h => {
     const value = request.headers.get(h);
     if (value) headers.set(h, value);
   });
   
-  headers.set('User-Agent', 
-    request.headers.get('User-Agent') || 
-    'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36'
-  );
-  
+  headers.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36');
   headers.set('Accept', '*/*');
-  
-  // SPEED: Disable compression for binary files (already compressed)
   headers.set('Accept-Encoding', 'identity');
-  
-  // SPEED: Keep connection alive for multiple requests
   headers.set('Connection', 'keep-alive');
-  headers.set('Keep-Alive', 'timeout=300, max=1000');
   
   const customReferer = params.get('referer');
   const customOrigin = params.get('origin');
@@ -602,7 +471,6 @@ function buildMobileHeaders(request, target, params) {
     headers.set('Referer', customReferer || target.origin + '/');
     headers.set('Origin', customOrigin || target.origin);
   }
-
   return headers;
 }
 
@@ -610,10 +478,7 @@ function buildResponseHeaders(response, rangeHeader) {
   const headers = new Headers(response.headers);
   addCorsHeaders(headers);
   
-  if (!headers.has('Accept-Ranges')) {
-    headers.set('Accept-Ranges', 'bytes');
-  }
-  
+  if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
   headers.delete('Content-Encoding');
   
   if (!rangeHeader && response.status === 200) {
@@ -624,7 +489,6 @@ function buildResponseHeaders(response, rangeHeader) {
   }
 
   ['Content-Security-Policy', 'X-Frame-Options', 'Set-Cookie'].forEach(h => headers.delete(h));
-  
   return headers;
 }
 
@@ -635,20 +499,17 @@ function normalizeCacheKey(url) {
 async function getCachedResponse(cache, targetUrl) {
   const cacheKey = normalizeCacheKey(targetUrl);
   const cached = await cache.match(new Request(cacheKey, { method: 'GET' }));
-  
   if (!cached) return null;
   
   const headers = new Headers(cached.headers);
   headers.set('X-Cache-Status', 'HIT');
   addCorsHeaders(headers);
-  
   return new Response(cached.body, { status: cached.status, headers });
 }
 
 function validateTargetUrl(url) {
   try {
     const parsed = new URL(url);
-    
     if (!['http:', 'https:'].includes(parsed.protocol)) {
       return { valid: false, error: 'Invalid protocol', status: 400 };
     }
@@ -661,14 +522,11 @@ function validateTargetUrl(url) {
     
     for (const pattern of privatePatterns) {
       if (typeof pattern === 'string') {
-        if (hostname === pattern) {
-          return { valid: false, error: 'Private IP not allowed', status: 403 };
-        }
+        if (hostname === pattern) return { valid: false, error: 'Private IP blocked', status: 403 };
       } else if (pattern.test(hostname)) {
-        return { valid: false, error: 'Private IP not allowed', status: 403 };
+        return { valid: false, error: 'Private IP blocked', status: 403 };
       }
     }
-    
     return { valid: true, url: parsed };
   } catch (e) {
     return { valid: false, error: 'Invalid URL', status: 400 };
@@ -680,7 +538,7 @@ function getCorsHeaders() {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': 'Range, Content-Type, If-Range, If-None-Match, If-Modified-Since',
-    'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges, Content-Type, Content-Disposition, ETag, Last-Modified, X-Drive-API, X-Cache-Status, X-Service-Account',
+    'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges, Content-Type, Content-Disposition, X-Drive-API, X-Cache-Status',
     'Access-Control-Max-Age': '86400'
   };
 }
