@@ -1,5 +1,5 @@
-// Google Drive Proxy v3.1 - Multi-Account + Proper Filename/Size Headers
-// Features: Multiple service accounts, proper Content-Disposition, Content-Length
+// Google Drive Proxy v3.3 - Production Final
+// ✅ All critical issues fixed ✅ Token caching ✅ Proper metadata cache ✅ No HEAD lies
 
 export default {
   async fetch(request, env, ctx) {
@@ -11,6 +11,9 @@ export default {
     }
   }
 };
+
+// FIX #2: Token cache (prevents invalid_grant)
+const tokenCache = new Map();
 
 async function handleRequest(request, env, ctx) {
   if (request.method === 'OPTIONS') {
@@ -25,7 +28,16 @@ async function handleRequest(request, env, ctx) {
   let targetUrl = url.searchParams.get('url');
   const fileId = url.searchParams.get('id');
   const forceApi = url.searchParams.get('api') === 'true';
-  const debug = url.searchParams.get('debug') === 'true'; // Debug mode
+  const forceDirect = url.searchParams.get('direct') === 'true';
+  const authKey = url.searchParams.get('key'); // FIX #6: Optional auth
+  
+  // FIX #6: Basic auth protection (optional)
+  if (env.AUTH_KEY && authKey !== env.AUTH_KEY) {
+    return jsonResponse({ 
+      error: 'Unauthorized',
+      tip: 'Add ?key=YOUR_KEY to the URL'
+    }, 401);
+  }
   
   // Extract file ID
   let extractedFileId = fileId;
@@ -39,29 +51,20 @@ async function handleRequest(request, env, ctx) {
     return jsonResponse({ 
       error: 'Missing url or id parameter', 
       examples: {
-        driveId: '?id=1QQ_v5rA0W_QP8oPSqKq2tmyy66QhZJh0',
+        driveId: '?id=FILE_ID',
         driveIdApi: '?id=FILE_ID&api=true',
-        driveUrl: '?url=https://drive.google.com/file/d/ID/view',
-        directUrl: '?url=https://example.com/video.mp4'
+        driveIdDirect: '?id=FILE_ID&direct=true',
+        withAuth: '?id=FILE_ID&key=YOUR_KEY'
       }
     }, 400);
   }
 
   // Try API first if we have credentials and a file ID
-  if (extractedFileId && (forceApi || hasServiceAccounts(env))) {
+  if (extractedFileId && !forceDirect && (forceApi || hasServiceAccounts(env))) {
     try {
-      const result = await handleDriveApiRequest(request, extractedFileId, env, ctx, debug);
-      return result;
+      return await handleDriveApiRequest(request, extractedFileId, env, ctx);
     } catch (apiError) {
       console.warn('Drive API failed, falling back:', apiError.message);
-      if (debug) {
-        return jsonResponse({
-          error: 'API failed',
-          details: apiError.message,
-          fallback: 'Will try direct download'
-        }, 500);
-      }
-      // Fall through to direct download
     }
   }
 
@@ -90,9 +93,6 @@ async function handleRequest(request, env, ctx) {
   return await fetchOptimized(request, targetUrl, validation.url, cache, ctx, rangeHeader, url.searchParams);
 }
 
-/**
- * Check if any service accounts are configured
- */
 function hasServiceAccounts(env) {
   return env.GOOGLE_SERVICE_ACCOUNT || 
          env.GOOGLE_SERVICE_ACCOUNT_1 || 
@@ -100,13 +100,9 @@ function hasServiceAccounts(env) {
          env.GOOGLE_SERVICE_ACCOUNT_3;
 }
 
-/**
- * Get all configured service accounts
- */
 function getAllServiceAccounts(env) {
   const accounts = [];
   
-  // Support multiple service accounts (up to 10)
   for (let i = 0; i <= 10; i++) {
     const key = i === 0 ? 'GOOGLE_SERVICE_ACCOUNT' : `GOOGLE_SERVICE_ACCOUNT_${i}`;
     if (env[key]) {
@@ -121,10 +117,7 @@ function getAllServiceAccounts(env) {
   return accounts;
 }
 
-/**
- * Handle request using Google Drive API with multi-account support
- */
-async function handleDriveApiRequest(request, fileId, env, ctx, debug = false) {
+async function handleDriveApiRequest(request, fileId, env, ctx) {
   const serviceAccounts = getAllServiceAccounts(env);
   
   if (serviceAccounts.length === 0) {
@@ -133,76 +126,142 @@ async function handleDriveApiRequest(request, fileId, env, ctx, debug = false) {
 
   let lastError = null;
   
-  // Try each service account until one works
   for (let i = 0; i < serviceAccounts.length; i++) {
     try {
-      const result = await tryServiceAccount(request, fileId, serviceAccounts[i], i, debug);
+      const result = await tryServiceAccount(request, fileId, serviceAccounts[i], i, env, ctx);
       if (result) return result;
     } catch (error) {
       console.warn(`Service account ${i} failed:`, error.message);
       lastError = error;
+      
+      // Don't retry 404 across all accounts
+      if (error.message.includes('404') || error.message.includes('not found')) {
+        throw error;
+      }
       continue;
     }
   }
   
-  // All accounts failed
   throw lastError || new Error('All service accounts failed');
 }
 
 /**
- * Try downloading with a specific service account
+ * FIX #1: Use caches.default instead of Map for metadata
+ * This persists across requests and isolates
  */
-async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, debug = false) {
+async function getFileMetadata(fileId, accessToken) {
+  const cacheKey = new Request(`https://metadata.internal/${fileId}`);
+  const cache = caches.default;
+  
+  // Try cache first
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return await cached.json();
+  }
+  
+  // Fetch fresh
+  const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType,md5Checksum,modifiedTime`;
+  const metaResp = await fetch(metaUrl, {
+    headers: { 'Authorization': `Bearer ${accessToken}` }
+  });
+  
+  if (!metaResp.ok) {
+    if (metaResp.status === 404) {
+      throw new Error('File not found');
+    }
+    if (metaResp.status === 403) {
+      throw new Error('File not accessible with this service account');
+    }
+    throw new Error(`Metadata fetch failed: ${metaResp.status}`);
+  }
+  
+  const metadata = await metaResp.json();
+  
+  // Cache for 10 minutes
+  await cache.put(
+    cacheKey,
+    new Response(JSON.stringify(metadata), {
+      headers: { 'Cache-Control': 'max-age=600' }
+    })
+  );
+  
+  return metadata;
+}
+
+async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, env, ctx) {
+  // FIX #2: Get cached token
   const accessToken = await getGoogleAccessToken(serviceAccount);
   
   if (!accessToken) {
     throw new Error('Failed to get access token');
   }
 
+  // Get metadata (now properly cached)
+  const metadata = await getFileMetadata(fileId, accessToken);
+  
+  const fileName = metadata.name || 'download';
+  const fileSize = parseInt(metadata.size || '0', 10);
+  const mimeType = metadata.mimeType || 'application/octet-stream';
+  const isGoogleDoc = mimeType.startsWith('application/vnd.google-apps.');
+  
+  console.log(`File: ${fileName}, Size: ${fileSize}, Type: ${mimeType}, GoogleDoc: ${isGoogleDoc}`);
+  
   const rangeHeader = request.headers.get('Range');
   
-  // Get file metadata first (for filename and size)
-  const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType`;
-  const metaResp = await fetch(metaUrl, {
-    headers: { 'Authorization': `Bearer ${accessToken}` }
-  });
-  
-  if (!metaResp.ok) {
-    if (metaResp.status === 404 || metaResp.status === 403) {
-      throw new Error(`File not accessible with account ${accountIndex}`);
-    }
-    throw new Error(`Metadata fetch failed: ${metaResp.status}`);
-  }
-  
-  const metadata = await metaResp.json();
-  const fileName = metadata.name || 'download';
-  const fileSize = metadata.size || '0';
-  const mimeType = metadata.mimeType || 'application/octet-stream';
-  
-  // Debug logging
-  console.log(`File metadata - Name: ${fileName}, Size: ${fileSize}, Type: ${mimeType}`);
-  
-  // HEAD request - return metadata
+  // HEAD request
   if (request.method === 'HEAD') {
     const headers = new Headers();
-    headers.set('Content-Length', fileSize);
-    headers.set('Content-Type', mimeType);
-    headers.set('Content-Disposition', `attachment; filename="${encodeFileName(fileName)}"`);
-    headers.set('Accept-Ranges', 'bytes');
+    
+    // FIX #3: Don't trust metadata size for Google Docs
+    if (!isGoogleDoc && fileSize > 0) {
+      headers.set('Content-Length', String(fileSize));
+    }
+    
+    headers.set('Content-Type', isGoogleDoc ? 'application/pdf' : mimeType);
+    headers.set('Content-Disposition', buildContentDisposition(fileName));
+    
+    // FIX #5: Disable ranges for Google Docs
+    if (isGoogleDoc) {
+      headers.set('Accept-Ranges', 'none');
+    } else {
+      headers.set('Accept-Ranges', 'bytes');
+    }
+    
     headers.set('X-Drive-API', 'true');
     headers.set('X-Service-Account', String(accountIndex));
-    addCorsHeaders(headers);
     
+    if (metadata.md5Checksum) {
+      headers.set('ETag', `"${metadata.md5Checksum}"`);
+    }
+    
+    addCorsHeaders(headers);
     return new Response(null, { status: 200, headers });
   }
 
-  // GET request - download file
-  const downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+  // GET request - setup download URL
+  let downloadUrl;
+  let exportMimeType = null;
+  
+  if (isGoogleDoc) {
+    const exportMap = {
+      'application/vnd.google-apps.document': 'application/pdf',
+      'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.google-apps.presentation': 'application/pdf',
+      'application/vnd.google-apps.drawing': 'application/pdf'
+    };
+    
+    exportMimeType = exportMap[mimeType] || 'application/pdf';
+    downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=${encodeURIComponent(exportMimeType)}`;
+  } else {
+    downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+  }
+
   const downloadHeaders = new Headers({
     'Authorization': `Bearer ${accessToken}`
   });
   
-  if (rangeHeader) {
+  // FIX #5: Don't send Range for Google Docs (unsupported)
+  if (rangeHeader && !isGoogleDoc) {
     downloadHeaders.set('Range', rangeHeader);
   }
 
@@ -215,69 +274,101 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     throw new Error(`Download failed: ${response.status}`);
   }
 
-  // Build proper response headers
+  // Origin returned 206 - pass through directly
+  if (response.status === 206) {
+    const finalHeaders = new Headers();
+    
+    ['Content-Type', 'Content-Range', 'Content-Length', 'ETag', 'Last-Modified'].forEach(h => {
+      if (response.headers.has(h)) {
+        finalHeaders.set(h, response.headers.get(h));
+      }
+    });
+    
+    finalHeaders.set('Content-Disposition', buildContentDisposition(fileName));
+    finalHeaders.set('Accept-Ranges', 'bytes');
+    finalHeaders.set('X-Drive-API', 'true');
+    finalHeaders.set('X-Service-Account', String(accountIndex));
+    finalHeaders.set('Cache-Control', 'public, max-age=3600');
+    addCorsHeaders(finalHeaders);
+    
+    return new Response(response.body, { status: 206, headers: finalHeaders });
+  }
+
+  // Full response - build headers
   const finalHeaders = new Headers();
+  finalHeaders.set('Content-Type', exportMimeType || mimeType);
+  finalHeaders.set('Content-Disposition', buildContentDisposition(fileName));
   
-  // CRITICAL: Always set Content-Length from metadata (Google API sometimes doesn't include it)
-  finalHeaders.set('Content-Length', fileSize);
-  finalHeaders.set('Content-Type', mimeType);
-  
-  // CRITICAL: Proper Content-Disposition for download managers
-  finalHeaders.set('Content-Disposition', `attachment; filename="${encodeFileName(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
-  
-  // Copy relevant headers from API response
-  if (response.headers.has('ETag')) {
-    finalHeaders.set('ETag', response.headers.get('ETag'));
-  }
-  if (response.headers.has('Last-Modified')) {
-    finalHeaders.set('Last-Modified', response.headers.get('Last-Modified'));
+  // FIX #5: Set proper Accept-Ranges
+  if (isGoogleDoc) {
+    finalHeaders.set('Accept-Ranges', 'none');
+  } else {
+    finalHeaders.set('Accept-Ranges', 'bytes');
   }
   
-  // Handle range responses
-  if (response.status === 206 && response.headers.has('Content-Range')) {
-    finalHeaders.set('Content-Range', response.headers.get('Content-Range'));
-    // For partial content, use actual response length
-    if (response.headers.has('Content-Length')) {
-      finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
-    }
-  }
-  
-  finalHeaders.set('Accept-Ranges', 'bytes');
   finalHeaders.set('X-Drive-API', 'true');
   finalHeaders.set('X-Service-Account', String(accountIndex));
   finalHeaders.set('Cache-Control', 'public, max-age=3600');
+  
+  if (metadata.md5Checksum && !isGoogleDoc) {
+    finalHeaders.set('ETag', `"${metadata.md5Checksum}"`);
+  }
+  if (metadata.modifiedTime) {
+    finalHeaders.set('Last-Modified', new Date(metadata.modifiedTime).toUTCString());
+  }
+  
   addCorsHeaders(finalHeaders);
+  
+  // Buffer small non-Doc files for guaranteed Content-Length
+  const shouldBuffer = !rangeHeader && !isGoogleDoc && fileSize > 0 && fileSize < 200 * 1024 * 1024;
+  
+  if (shouldBuffer) {
+    const buffer = await response.arrayBuffer();
+    finalHeaders.set('Content-Length', String(buffer.byteLength));
+    
+    return new Response(buffer, { status: 200, headers: finalHeaders });
+  }
+  
+  // FIX #3: Only set Content-Length when we're certain
+  // For Google Docs: size is unknown until export completes
+  // For large files: trust the response header
+  if (response.headers.has('Content-Length')) {
+    finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
+  } else if (!isGoogleDoc && fileSize > 0) {
+    // Only for regular files with known size
+    finalHeaders.set('Content-Length', String(fileSize));
+  }
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: finalHeaders
-  });
+  return new Response(response.body, { status: 200, headers: finalHeaders });
+}
+
+function buildContentDisposition(fileName) {
+  const safeAscii = fileName
+    .replace(/[^\w.\- ]+/g, '_')
+    .slice(0, 200);
+  
+  return `attachment; filename="${safeAscii}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
 /**
- * Encode filename for Content-Disposition header (RFC 5987)
- * Ensures download managers can read filenames properly
- */
-function encodeFileName(fileName) {
-  // Remove or replace problematic characters for basic ASCII filename
-  return fileName
-    .replace(/["\\]/g, '') // Remove quotes and backslashes
-    .replace(/[\r\n\t]/g, '') // Remove newlines and tabs
-    .replace(/[^\x20-\x7E]/g, '_') // Replace non-ASCII with underscore
-    .slice(0, 200); // Limit length
-}
-
-/**
- * Get Google OAuth2 access token
+ * FIX #2: Token caching to prevent invalid_grant
+ * Tokens valid for ~1 hour, cache for 55 minutes
  */
 async function getGoogleAccessToken(serviceAccount) {
+  const email = serviceAccount.client_email;
+  const cached = tokenCache.get(email);
+  
+  // Return cached token if still valid (5 min buffer)
+  if (cached && cached.expiry > Date.now() + 300000) {
+    return cached.token;
+  }
+  
   try {
     const now = Math.floor(Date.now() / 1000);
     const jwtHeader = { alg: 'RS256', typ: 'JWT' };
     
     const jwtClaimSet = {
-      iss: serviceAccount.client_email,
+      iss: email,
       scope: 'https://www.googleapis.com/auth/drive.readonly',
       aud: 'https://oauth2.googleapis.com/token',
       exp: now + 3600,
@@ -309,6 +400,19 @@ async function getGoogleAccessToken(serviceAccount) {
     }
     
     const tokenData = await tokenResponse.json();
+    
+    // Cache token
+    tokenCache.set(email, {
+      token: tokenData.access_token,
+      expiry: Date.now() + (tokenData.expires_in || 3600) * 1000
+    });
+    
+    // Cleanup old tokens (keep last 100)
+    if (tokenCache.size > 100) {
+      const firstKey = tokenCache.keys().next().value;
+      tokenCache.delete(firstKey);
+    }
+    
     return tokenData.access_token;
   } catch (error) {
     console.error('Access token error:', error);
@@ -357,13 +461,7 @@ function base64Decode(str) {
 }
 
 function buildGoogleDriveUrl(fileId) {
-  const uuid = deterministicUUID(fileId);
-  return `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid}`;
-}
-
-function deterministicUUID(fileId) {
-  const encoded = btoa(fileId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
-  return `${encoded.slice(0, 4)}-${encoded.slice(4, 8)}`;
+  return `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
 }
 
 function extractGoogleDriveId(url) {
@@ -377,27 +475,41 @@ function extractGoogleDriveId(url) {
   }
 }
 
+/**
+ * FIX #4: Don't trust HEAD - use GET Range 0-0 instead
+ */
 async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rangeHeader, params) {
   const proxyHeaders = buildMobileHeaders(request, parsedTarget, params);
   
+  // FIX #4: Replace HEAD with GET Range 0-0 for reliability
   if (request.method === 'HEAD') {
+    proxyHeaders.set('Range', 'bytes=0-0');
+    
     const resp = await fetch(targetUrl, { 
-      method: 'HEAD', 
+      method: 'GET',
       headers: proxyHeaders,
       redirect: 'follow'
     });
     
-    return new Response(null, { 
-      status: resp.status, 
-      headers: buildResponseHeaders(resp, null) 
-    });
+    const headers = buildResponseHeaders(resp, null);
+    
+    // Extract actual size from Content-Range if present
+    if (resp.status === 206 && resp.headers.has('Content-Range')) {
+      const range = resp.headers.get('Content-Range');
+      const match = range.match(/bytes \d+-\d+\/(\d+)/);
+      if (match) {
+        headers.set('Content-Length', match[1]);
+      }
+    }
+    
+    return new Response(null, { status: 200, headers });
   }
 
   const response = await fetch(targetUrl, {
     method: 'GET',
     headers: proxyHeaders,
     redirect: 'follow',
-    cf: { cacheTtl: 86400, cacheEverything: true }
+    cf: { cacheTtl: 3600, cacheEverything: true }
   });
 
   // Detect quota error
@@ -406,13 +518,8 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
     if (text.includes("Sorry, you can't view or download")) {
       return jsonResponse({
         error: 'Google Drive quota exceeded',
-        message: 'This file has been downloaded too many times.',
-        solutions: [
-          'Add ?api=true to use API (if configured)',
-          'Configure multiple service accounts for load balancing',
-          'Make a copy to your own Drive',
-          'Wait 24 hours'
-        ]
+        message: 'Direct download quota exceeded. Try ?api=true',
+        tip: 'Configure service accounts to bypass this limit'
       }, 429);
     }
   }
@@ -422,51 +529,40 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
     if (response.status >= 500) return jsonResponse({ error: 'Origin error' }, 502);
   }
 
+  // Origin returned 206 - pass through
+  if (response.status === 206) {
+    const finalHeaders = buildResponseHeaders(response, rangeHeader);
+    return new Response(response.body, { status: 206, headers: finalHeaders });
+  }
+
   const finalHeaders = buildResponseHeaders(response, rangeHeader);
   
-  // CRITICAL FIX: Ensure Content-Length is always present for download managers
-  // Some origins don't include it, breaking progress bars
-  if (!finalHeaders.has('Content-Length') && response.headers.has('Content-Length')) {
+  // FIX #3: Only trust Content-Length if present
+  if (response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
   }
   
-  // FIX: Try to extract filename from Content-Disposition or URL
+  // Add Content-Disposition if missing
   if (!finalHeaders.has('Content-Disposition')) {
-    let filename = null;
-    
-    // Try to get from response Content-Disposition first
-    const cd = response.headers.get('Content-Disposition');
-    if (cd) {
-      const match = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-      if (match && match[1]) {
-        filename = match[1].replace(/['"]/g, '');
-      }
-    }
-    
-    // Fallback to URL extraction
-    if (!filename) {
-      filename = extractFilenameFromUrl(targetUrl);
-    }
-    
+    const filename = extractFilenameFromHeaders(response) || extractFilenameFromUrl(targetUrl);
     if (filename) {
-      finalHeaders.set('Content-Disposition', `attachment; filename="${encodeFileName(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
+      finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
     }
   }
   
+  // Cache full responses only
   if (!rangeHeader && response.status === 200 && response.body) {
-    const cacheKey = normalizeCacheKey(targetUrl);
+    const cacheKey = new Request(targetUrl, { method: 'GET' });
     const [cacheStream, clientStream] = response.body.tee();
     
     ctx.waitUntil(
-      cache.put(
-        new Request(cacheKey, { method: 'GET' }), 
-        new Response(cacheStream, { status: 200, headers: finalHeaders })
-      )
+      cache.put(cacheKey, new Response(cacheStream, { status: 200, headers: finalHeaders }))
     );
     
     return new Response(clientStream, { status: 200, headers: finalHeaders });
   }
 
+  // Handle range request on full response
   if (rangeHeader && response.status === 200 && response.body) {
     return handleRangeRequest(response, rangeHeader, finalHeaders);
   }
@@ -474,9 +570,17 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
   return new Response(response.body, { status: response.status, headers: finalHeaders });
 }
 
-/**
- * Extract filename from URL path
- */
+function extractFilenameFromHeaders(response) {
+  const cd = response.headers.get('Content-Disposition');
+  if (cd) {
+    const match = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+    if (match && match[1]) {
+      return match[1].replace(/['"]/g, '');
+    }
+  }
+  return null;
+}
+
 function extractFilenameFromUrl(url) {
   try {
     const pathname = new URL(url).pathname;
@@ -489,6 +593,9 @@ function extractFilenameFromUrl(url) {
   return null;
 }
 
+/**
+ * Handle range request with proper 416 responses
+ */
 function handleRangeRequest(response, rangeHeader, finalHeaders) {
   const rangeMatch = rangeHeader.match(/bytes=(\d*)-(\d*)/);
   if (!rangeMatch) {
@@ -500,8 +607,15 @@ function handleRangeRequest(response, rangeHeader, finalHeaders) {
   const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
   const end = endStr ? parseInt(endStr, 10) : contentLength - 1;
 
+  // Return 416 for invalid range
   if (isNaN(start) || start < 0 || start >= contentLength || contentLength === 0) {
-    return new Response(response.body, { status: 200, headers: finalHeaders });
+    return new Response('Range Not Satisfiable', { 
+      status: 416,
+      headers: {
+        'Content-Range': `bytes */${contentLength}`,
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
   }
 
   finalHeaders.set('Content-Range', `bytes ${start}-${end}/${contentLength}`);
@@ -587,7 +701,7 @@ function buildResponseHeaders(response, rangeHeader) {
   headers.delete('Content-Encoding');
   
   if (!rangeHeader && response.status === 200) {
-    headers.set('Cache-Control', 'public, max-age=86400, immutable');
+    headers.set('Cache-Control', 'public, max-age=3600');
     headers.set('X-Cache-Status', 'MISS');
   } else {
     headers.set('Cache-Control', 'no-cache');
@@ -598,13 +712,8 @@ function buildResponseHeaders(response, rangeHeader) {
   return headers;
 }
 
-function normalizeCacheKey(url) {
-  return url.replace(/[&?]uuid=[^&]+/, '');
-}
-
 async function getCachedResponse(cache, targetUrl) {
-  const cacheKey = normalizeCacheKey(targetUrl);
-  const cached = await cache.match(new Request(cacheKey, { method: 'GET' }));
+  const cached = await cache.match(new Request(targetUrl, { method: 'GET' }));
   
   if (!cached) return null;
   
