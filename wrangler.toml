@@ -1,3 +1,4 @@
-name = "proxy-worker"
+# wrangler.toml
+name = 'proxy-dw'
 main = "index.js"
 compatibility_date = "2025-10-12"
