@@ -4,7 +4,17 @@
 export default {
   async fetch(request, env, ctx) {
     try {
-      return await handleRequest(request, env, ctx);
+        const url = new URL(request.url);
+if (url.pathname === '/health') {
+  return new Response('OK', {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/plain',
+      'Cache-Control': 'no-store'
+    }
+  });
+}
+        return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Worker error:', error);
       return jsonResponse({ error: 'Server error', details: error.message }, 500);
