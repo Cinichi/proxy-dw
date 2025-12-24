@@ -1,20 +1,10 @@
-// Google Drive Proxy v3.3 - Production Final
-// ✅ All critical issues fixed ✅ Token caching ✅ Proper metadata cache ✅ No HEAD lies
+// Google Drive Proxy v3.4 - Multi-Range Ready
+// ✓ Allows parallel chunks ✓ Fast streaming ✓ Fixed HEAD reliability
 
 export default {
   async fetch(request, env, ctx) {
     try {
-        const url = new URL(request.url);
-if (url.pathname === '/health') {
-  return new Response('OK', {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/plain',
-      'Cache-Control': 'no-store'
-    }
-  });
-}
-        return await handleRequest(request, env, ctx);
+      return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Worker error:', error);
       return jsonResponse({ error: 'Server error', details: error.message }, 500);
@@ -22,7 +12,7 @@ if (url.pathname === '/health') {
   }
 };
 
-// FIX #2: Token cache (prevents invalid_grant)
+// Token cache (prevents invalid_grant and speeds up auth)
 const tokenCache = new Map();
 
 async function handleRequest(request, env, ctx) {
@@ -39,15 +29,6 @@ async function handleRequest(request, env, ctx) {
   const fileId = url.searchParams.get('id');
   const forceApi = url.searchParams.get('api') === 'true';
   const forceDirect = url.searchParams.get('direct') === 'true';
-  const authKey = url.searchParams.get('key'); // FIX #6: Optional auth
-  
-  // FIX #6: Basic auth protection (optional)
-  if (env.AUTH_KEY && authKey !== env.AUTH_KEY) {
-    return jsonResponse({ 
-      error: 'Unauthorized',
-      tip: 'Add ?key=YOUR_KEY to the URL'
-    }, 401);
-  }
   
   // Extract file ID
   let extractedFileId = fileId;
@@ -62,14 +43,13 @@ async function handleRequest(request, env, ctx) {
       error: 'Missing url or id parameter', 
       examples: {
         driveId: '?id=FILE_ID',
-        driveIdApi: '?id=FILE_ID&api=true',
-        driveIdDirect: '?id=FILE_ID&direct=true',
-        withAuth: '?id=FILE_ID&key=YOUR_KEY'
+        driveIdApi: '?id=FILE_ID&api=true (recommended)',
+        driveUrl: '?url=https://drive.google.com/file/d/ID/view'
       }
     }, 400);
   }
 
-  // Try API first if we have credentials and a file ID
+  // Try API first if credentials available (unless forced direct)
   if (extractedFileId && !forceDirect && (forceApi || hasServiceAccounts(env))) {
     try {
       return await handleDriveApiRequest(request, extractedFileId, env, ctx);
@@ -138,7 +118,7 @@ async function handleDriveApiRequest(request, fileId, env, ctx) {
   
   for (let i = 0; i < serviceAccounts.length; i++) {
     try {
-      const result = await tryServiceAccount(request, fileId, serviceAccounts[i], i, env, ctx);
+      const result = await tryServiceAccount(request, fileId, serviceAccounts[i], i);
       if (result) return result;
     } catch (error) {
       console.warn(`Service account ${i} failed:`, error.message);
@@ -156,14 +136,13 @@ async function handleDriveApiRequest(request, fileId, env, ctx) {
 }
 
 /**
- * FIX #1: Use caches.default instead of Map for metadata
- * This persists across requests and isolates
+ * Use caches.default for metadata (faster + persistent)
  */
 async function getFileMetadata(fileId, accessToken) {
   const cacheKey = new Request(`https://metadata.internal/${fileId}`);
   const cache = caches.default;
   
-  // Try cache first
+  // Try cache first (fast!)
   const cached = await cache.match(cacheKey);
   if (cached) {
     return await cached.json();
@@ -176,12 +155,8 @@ async function getFileMetadata(fileId, accessToken) {
   });
   
   if (!metaResp.ok) {
-    if (metaResp.status === 404) {
-      throw new Error('File not found');
-    }
-    if (metaResp.status === 403) {
-      throw new Error('File not accessible with this service account');
-    }
+    if (metaResp.status === 404) throw new Error('File not found');
+    if (metaResp.status === 403) throw new Error('File not accessible');
     throw new Error(`Metadata fetch failed: ${metaResp.status}`);
   }
   
@@ -198,15 +173,18 @@ async function getFileMetadata(fileId, accessToken) {
   return metadata;
 }
 
-async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, env, ctx) {
-  // FIX #2: Get cached token
+/**
+ * SPEED OPTIMIZED: Stream directly, correct multi-range support
+ */
+async function tryServiceAccount(request, fileId, serviceAccount, accountIndex) {
+  // Get cached token (prevents invalid_grant, faster)
   const accessToken = await getGoogleAccessToken(serviceAccount);
   
   if (!accessToken) {
     throw new Error('Failed to get access token');
   }
 
-  // Get metadata (now properly cached)
+  // Get metadata (cached = fast)
   const metadata = await getFileMetadata(fileId, accessToken);
   
   const fileName = metadata.name || 'download';
@@ -214,15 +192,13 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   const mimeType = metadata.mimeType || 'application/octet-stream';
   const isGoogleDoc = mimeType.startsWith('application/vnd.google-apps.');
   
-  console.log(`File: ${fileName}, Size: ${fileSize}, Type: ${mimeType}, GoogleDoc: ${isGoogleDoc}`);
-  
   const rangeHeader = request.headers.get('Range');
   
-  // HEAD request
+  // HEAD request - provide accurate size for clients
   if (request.method === 'HEAD') {
     const headers = new Headers();
     
-    // FIX #3: Don't trust metadata size for Google Docs
+    // Set Content-Length for non-Docs with known size
     if (!isGoogleDoc && fileSize > 0) {
       headers.set('Content-Length', String(fileSize));
     }
@@ -230,7 +206,7 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     headers.set('Content-Type', isGoogleDoc ? 'application/pdf' : mimeType);
     headers.set('Content-Disposition', buildContentDisposition(fileName));
     
-    // FIX #5: Disable ranges for Google Docs
+    // Accept-Ranges enables client-side chunking
     if (isGoogleDoc) {
       headers.set('Accept-Ranges', 'none');
     } else {
@@ -243,12 +219,15 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     if (metadata.md5Checksum) {
       headers.set('ETag', `"${metadata.md5Checksum}"`);
     }
+    if (metadata.modifiedTime) {
+      headers.set('Last-Modified', new Date(metadata.modifiedTime).toUTCString());
+    }
     
     addCorsHeaders(headers);
     return new Response(null, { status: 200, headers });
   }
 
-  // GET request - setup download URL
+  // GET request - setup download
   let downloadUrl;
   let exportMimeType = null;
   
@@ -270,7 +249,7 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     'Authorization': `Bearer ${accessToken}`
   });
   
-  // FIX #5: Don't send Range for Google Docs (unsupported)
+  // Forward Range header for multi-range downloads
   if (rangeHeader && !isGoogleDoc) {
     downloadHeaders.set('Range', rangeHeader);
   }
@@ -284,10 +263,11 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     throw new Error(`Download failed: ${response.status}`);
   }
 
-  // Origin returned 206 - pass through directly
+  // Origin returned 206 (partial content) - pass through directly
   if (response.status === 206) {
     const finalHeaders = new Headers();
     
+    // Preserve all range headers
     ['Content-Type', 'Content-Range', 'Content-Length', 'ETag', 'Last-Modified'].forEach(h => {
       if (response.headers.has(h)) {
         finalHeaders.set(h, response.headers.get(h));
@@ -301,15 +281,16 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     finalHeaders.set('Cache-Control', 'public, max-age=3600');
     addCorsHeaders(finalHeaders);
     
+    // Stream directly - NO buffering
     return new Response(response.body, { status: 206, headers: finalHeaders });
   }
 
-  // Full response - build headers
+  // Full response - Stream directly
   const finalHeaders = new Headers();
   finalHeaders.set('Content-Type', exportMimeType || mimeType);
   finalHeaders.set('Content-Disposition', buildContentDisposition(fileName));
   
-  // FIX #5: Set proper Accept-Ranges
+  // Set Accept-Ranges
   if (isGoogleDoc) {
     finalHeaders.set('Accept-Ranges', 'none');
   } else {
@@ -329,26 +310,14 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   
   addCorsHeaders(finalHeaders);
   
-  // Buffer small non-Doc files for guaranteed Content-Length
-  const shouldBuffer = !rangeHeader && !isGoogleDoc && fileSize > 0 && fileSize < 200 * 1024 * 1024;
-  
-  if (shouldBuffer) {
-    const buffer = await response.arrayBuffer();
-    finalHeaders.set('Content-Length', String(buffer.byteLength));
-    
-    return new Response(buffer, { status: 200, headers: finalHeaders });
-  }
-  
-  // FIX #3: Only set Content-Length when we're certain
-  // For Google Docs: size is unknown until export completes
-  // For large files: trust the response header
+  // Set Content-Length when certain
   if (response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
   } else if (!isGoogleDoc && fileSize > 0) {
-    // Only for regular files with known size
     finalHeaders.set('Content-Length', String(fileSize));
   }
 
+  // Stream directly - NO buffering for maximum speed
   return new Response(response.body, { status: 200, headers: finalHeaders });
 }
 
@@ -361,14 +330,13 @@ function buildContentDisposition(fileName) {
 }
 
 /**
- * FIX #2: Token caching to prevent invalid_grant
- * Tokens valid for ~1 hour, cache for 55 minutes
+ * Token caching (prevents invalid_grant, much faster)
  */
 async function getGoogleAccessToken(serviceAccount) {
   const email = serviceAccount.client_email;
   const cached = tokenCache.get(email);
   
-  // Return cached token if still valid (5 min buffer)
+  // Return cached token if valid (5 min buffer)
   if (cached && cached.expiry > Date.now() + 300000) {
     return cached.token;
   }
@@ -417,7 +385,7 @@ async function getGoogleAccessToken(serviceAccount) {
       expiry: Date.now() + (tokenData.expires_in || 3600) * 1000
     });
     
-    // Cleanup old tokens (keep last 100)
+    // Cleanup old tokens
     if (tokenCache.size > 100) {
       const firstKey = tokenCache.keys().next().value;
       tokenCache.delete(firstKey);
@@ -471,7 +439,13 @@ function base64Decode(str) {
 }
 
 function buildGoogleDriveUrl(fileId) {
-  return `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+  const uuid = deterministicUUID(fileId);
+  return `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid}`;
+}
+
+function deterministicUUID(fileId) {
+  const encoded = btoa(fileId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+  return `${encoded.slice(0, 4)}-${encoded.slice(4, 8)}`;
 }
 
 function extractGoogleDriveId(url) {
@@ -486,12 +460,13 @@ function extractGoogleDriveId(url) {
 }
 
 /**
- * FIX #4: Don't trust HEAD - use GET Range 0-0 instead
+ * Direct download path
+ * FIX: Use Range 0-0 instead of HEAD for reliable size detection
  */
 async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rangeHeader, params) {
   const proxyHeaders = buildMobileHeaders(request, parsedTarget, params);
   
-  // FIX #4: Replace HEAD with GET Range 0-0 for reliability
+  // FIX: HEAD is unreliable on Google Drive - use Range 0-0 instead
   if (request.method === 'HEAD') {
     proxyHeaders.set('Range', 'bytes=0-0');
     
@@ -501,7 +476,7 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
       redirect: 'follow'
     });
     
-    const headers = buildResponseHeaders(resp, null);
+    const headers = new Headers();
     
     // Extract actual size from Content-Range if present
     if (resp.status === 206 && resp.headers.has('Content-Range')) {
@@ -510,7 +485,19 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
       if (match) {
         headers.set('Content-Length', match[1]);
       }
+    } else if (resp.headers.has('Content-Length')) {
+      headers.set('Content-Length', resp.headers.get('Content-Length'));
     }
+    
+    // Copy other relevant headers
+    ['Content-Type', 'ETag', 'Last-Modified'].forEach(h => {
+      if (resp.headers.has(h)) {
+        headers.set(h, resp.headers.get(h));
+      }
+    });
+    
+    headers.set('Accept-Ranges', 'bytes');
+    addCorsHeaders(headers);
     
     return new Response(null, { status: 200, headers });
   }
@@ -547,12 +534,12 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
 
   const finalHeaders = buildResponseHeaders(response, rangeHeader);
   
-  // FIX #3: Only trust Content-Length if present
+  // Ensure Content-Length
   if (response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
   }
   
-  // Add Content-Disposition if missing
+  // Add Content-Disposition
   if (!finalHeaders.has('Content-Disposition')) {
     const filename = extractFilenameFromHeaders(response) || extractFilenameFromUrl(targetUrl);
     if (filename) {
@@ -560,19 +547,22 @@ async function fetchOptimized(request, targetUrl, parsedTarget, cache, ctx, rang
     }
   }
   
-  // Cache full responses only
+  // Cache full responses only (not chunks)
   if (!rangeHeader && response.status === 200 && response.body) {
-    const cacheKey = new Request(targetUrl, { method: 'GET' });
+    const cacheKey = normalizeCacheKey(targetUrl);
     const [cacheStream, clientStream] = response.body.tee();
     
     ctx.waitUntil(
-      cache.put(cacheKey, new Response(cacheStream, { status: 200, headers: finalHeaders }))
+      cache.put(
+        new Request(cacheKey, { method: 'GET' }), 
+        new Response(cacheStream, { status: 200, headers: finalHeaders })
+      )
     );
     
     return new Response(clientStream, { status: 200, headers: finalHeaders });
   }
 
-  // Handle range request on full response
+  // Handle range request on full response (worker slicing)
   if (rangeHeader && response.status === 200 && response.body) {
     return handleRangeRequest(response, rangeHeader, finalHeaders);
   }
@@ -604,7 +594,7 @@ function extractFilenameFromUrl(url) {
 }
 
 /**
- * Handle range request with proper 416 responses
+ * Handle range request - worker-side slicing
  */
 function handleRangeRequest(response, rangeHeader, finalHeaders) {
   const rangeMatch = rangeHeader.match(/bytes=(\d*)-(\d*)/);
@@ -628,9 +618,11 @@ function handleRangeRequest(response, rangeHeader, finalHeaders) {
     });
   }
 
+  // Set proper range headers
   finalHeaders.set('Content-Range', `bytes ${start}-${end}/${contentLength}`);
   finalHeaders.set('Content-Length', String(end - start + 1));
   
+  // Stream this specific range
   return new Response(
     response.body.pipeThrough(createEfficientSliceStream(start, end)),
     { status: 206, statusText: 'Partial Content', headers: finalHeaders }
@@ -671,6 +663,7 @@ function createEfficientSliceStream(start, end) {
 function buildMobileHeaders(request, target, params) {
   const headers = new Headers();
   
+  // Forward Range header for multi-range downloads
   const allowedHeaders = ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'];
   allowedHeaders.forEach(h => {
     const value = request.headers.get(h);
@@ -683,7 +676,6 @@ function buildMobileHeaders(request, target, params) {
   );
   
   headers.set('Accept', '*/*');
-  headers.set('Accept-Encoding', 'identity');
   headers.set('Connection', 'keep-alive');
   
   const customReferer = params.get('referer');
@@ -704,6 +696,7 @@ function buildResponseHeaders(response, rangeHeader) {
   const headers = new Headers(response.headers);
   addCorsHeaders(headers);
   
+  // Accept-Ranges enables client-side chunking
   if (!headers.has('Accept-Ranges')) {
     headers.set('Accept-Ranges', 'bytes');
   }
@@ -722,8 +715,13 @@ function buildResponseHeaders(response, rangeHeader) {
   return headers;
 }
 
+function normalizeCacheKey(url) {
+  return url.replace(/[&?]uuid=[^&]+/, '');
+}
+
 async function getCachedResponse(cache, targetUrl) {
-  const cached = await cache.match(new Request(targetUrl, { method: 'GET' }));
+  const cacheKey = normalizeCacheKey(targetUrl);
+  const cached = await cache.match(new Request(cacheKey, { method: 'GET' }));
   
   if (!cached) return null;
   
