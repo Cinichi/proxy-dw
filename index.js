@@ -285,6 +285,13 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     throw new Error(`Download failed: ${response.status}`);
   }
 
+  // Handle null-body status codes
+  if ([101, 204, 205, 304].includes(response.status)) {
+    const headers = new Headers(response.headers);
+    addCorsHeaders(headers);
+    return new Response(null, { status: response.status, headers });
+  }
+
   if (response.status === 206) {
     const finalHeaders = new Headers();
     
@@ -510,6 +517,13 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
 
     // Log for debugging
     console.log(`Fetch ${targetUrl}: ${response.status}`);
+    
+    // Handle null-body status codes (101, 204, 205, 304)
+    if ([101, 204, 205, 304].includes(response.status)) {
+      const headers = new Headers(response.headers);
+      addCorsHeaders(headers);
+      return new Response(null, { status: response.status, headers });
+    }
     
     if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
       const text = await response.text();
