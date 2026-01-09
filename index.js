@@ -550,6 +550,11 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
 
     const finalHeaders = buildResponseHeaders(response, isVideo);
     
+    // Ensure Content-Type is set for videos
+    if (isVideo && !finalHeaders.has('Content-Type')) {
+      finalHeaders.set('Content-Type', 'video/mp4');
+    }
+    
     if (response.headers.has('Content-Length')) {
       finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
     }
@@ -625,8 +630,17 @@ function buildResponseHeaders(response, isVideo) {
   const headers = new Headers(response.headers);
   addCorsHeaders(headers);
   
+  // Force correct video MIME type for browser compatibility
+  const contentType = response.headers.get('Content-Type');
+  if (isVideo && (!contentType || contentType === 'application/octet-stream')) {
+    headers.set('Content-Type', 'video/mp4');
+  }
+  
   if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
+  
+  // Remove headers that might break streaming
   headers.delete('Content-Encoding');
+  headers.delete('Transfer-Encoding');
   
   // Aggressive caching for video content
   if (isVideo) {
