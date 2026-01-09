@@ -1,28 +1,26 @@
-// Google Drive Proxy v3.5.1 - PRODUCTION STABLE
-// ✓ Cache API auth ✓ Zero-copy streaming ✓ Proper Range compliance ✓ Resume support
-// REMOVED: Smart prefetch (broke HTTP spec)
+// Google Drive Proxy v3.6.0 - STREAMING OPTIMIZED
+// ✓ HLS/DASH streaming ✓ M3U8 rewriting ✓ Video chunk support ✓ Aggressive caching
 
 export default {
   async fetch(request, env, ctx) {
     try {
-        const url = new URL(request.url);
-if (url.pathname === '/health') {
-  return new Response('OK', {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/plain',
-      'Cache-Control': 'no-store'
-    }
-  });
-}
-        return await handleRequest(request, env, ctx);
+      const url = new URL(request.url);
+      if (url.pathname === '/health') {
+        return new Response('OK', {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/plain',
+            'Cache-Control': 'no-store'
+          }
+        });
+      }
+      return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error('Worker error:', error);
       return jsonResponse({ error: 'Server error', details: error.message }, 500);
     }
   }
 };
-
 
 async function handleRequest(request, env, ctx) {
   if (request.method === 'OPTIONS') {
@@ -49,8 +47,8 @@ async function handleRequest(request, env, ctx) {
       error: 'Missing url or id parameter', 
       examples: {
         driveId: '?id=FILE_ID',
-        driveIdApi: '?id=FILE_ID&api=true (recommended)',
-        driveUrl: '?url=https://drive.google.com/file/d/ID/view'
+        video: '?url=https://example.com/video.mp4',
+        m3u8: '?url=https://example.com/playlist.m3u8'
       }
     }, 400);
   }
@@ -78,7 +76,65 @@ async function handleRequest(request, env, ctx) {
     return jsonResponse({ error: validation.error }, validation.status);
   }
 
+  // Check if M3U8 playlist (HLS streaming)
+  if (isM3U8Url(targetUrl)) {
+    return await handleM3U8Request(request, targetUrl, validation.url, ctx, url.searchParams);
+  }
+
   return await fetchDirect(request, targetUrl, validation.url, ctx, url.searchParams);
+}
+
+function isM3U8Url(url) {
+  return url.toLowerCase().includes('.m3u8') || url.toLowerCase().includes('m3u8');
+}
+
+function isVideoUrl(url) {
+  const videoExts = /\.(mp4|webm|mkv|avi|mov|flv|m4v|ts|mpg|mpeg|3gp|wmv)(\?|$)/i;
+  return videoExts.test(url);
+}
+
+/**
+ * Handle M3U8 playlists - rewrite URLs to proxy them
+ */
+async function handleM3U8Request(request, targetUrl, parsedTarget, ctx, params) {
+  const proxyHeaders = buildHeaders(request, parsedTarget, params);
+  
+  const response = await fetch(targetUrl, {
+    method: 'GET',
+    headers: proxyHeaders,
+    redirect: 'follow',
+    cf: { cacheTtl: 60 } // Cache playlists for 1 minute
+  });
+
+  if (!response.ok) {
+    return jsonResponse({ error: 'Failed to fetch playlist' }, response.status);
+  }
+
+  let content = await response.text();
+  const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+  const workerUrl = new URL(request.url).origin;
+
+  // Rewrite relative URLs in M3U8 to proxy through worker
+  content = content.split('\n').map(line => {
+    line = line.trim();
+    if (!line || line.startsWith('#')) return line;
+    
+    // Absolute URL
+    if (line.startsWith('http://') || line.startsWith('https://')) {
+      return `${workerUrl}/?url=${encodeURIComponent(line)}`;
+    }
+    
+    // Relative URL
+    const fullUrl = baseUrl + line;
+    return `${workerUrl}/?url=${encodeURIComponent(fullUrl)}`;
+  }).join('\n');
+
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/vnd.apple.mpegurl');
+  headers.set('Cache-Control', 'public, max-age=60');
+  addCorsHeaders(headers);
+
+  return new Response(content, { status: 200, headers });
 }
 
 function hasServiceAccounts(env) {
@@ -118,9 +174,6 @@ async function handleDriveApiRequest(request, fileId, env, ctx) {
   throw lastError || new Error('All accounts failed');
 }
 
-/**
- * Cache metadata for 10 minutes
- */
 async function getFileMetadata(fileId, accessToken, ctx) {
   const cache = caches.default;
   const cacheKey = new Request(`https://meta.internal/${fileId}`);
@@ -149,9 +202,6 @@ async function getFileMetadata(fileId, accessToken, ctx) {
   return metadata;
 }
 
-/**
- * HTTP-COMPLIANT: Pass through ranges exactly as requested
- */
 async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, ctx) {
   const accessToken = await getGoogleAccessToken(serviceAccount, ctx);
   if (!accessToken) throw new Error('No access token');
@@ -165,9 +215,7 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   
   const rangeHeader = request.headers.get('Range');
   
-  // HEAD request with Range 0-0 (proves range support to download managers)
   if (request.method === 'HEAD') {
-    // Make real Range request for proof
     const downloadUrl = isGoogleDoc 
       ? buildExportUrl(fileId, mimeType)
       : `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
@@ -184,7 +232,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     
     const headers = new Headers();
     
-    // Extract real size from Content-Range if available
     if (headResp.status === 206 && headResp.headers.has('Content-Range')) {
       const range = headResp.headers.get('Content-Range');
       const match = range.match(/bytes \d+-\d+\/(\d+)/);
@@ -212,7 +259,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     return new Response(null, { status: 200, headers });
   }
 
-  // GET request - setup download URL
   const downloadUrl = isGoogleDoc 
     ? buildExportUrl(fileId, mimeType)
     : `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
@@ -222,7 +268,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     'Connection': 'keep-alive'
   });
   
-  // CRITICAL: Forward Range header EXACTLY as client sent it
   if (rangeHeader && !isGoogleDoc) {
     downloadHeaders.set('Range', rangeHeader);
   }
@@ -230,18 +275,19 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   const response = await fetch(downloadUrl, {
     method: 'GET',
     headers: downloadHeaders,
-    cf: { cacheTtl: 3600 }
+    cf: { 
+      cacheTtl: 86400, // Cache video chunks for 24 hours
+      cacheEverything: isVideoMimeType(mimeType)
+    }
   });
 
   if (!response.ok) {
     throw new Error(`Download failed: ${response.status}`);
   }
 
-  // CRITICAL: Pass through 206 responses unchanged (HTTP compliance)
   if (response.status === 206) {
     const finalHeaders = new Headers();
     
-    // Copy ALL range-related headers from origin
     ['Content-Type', 'Content-Range', 'Content-Length', 'ETag', 'Last-Modified'].forEach(h => {
       if (response.headers.has(h)) {
         finalHeaders.set(h, response.headers.get(h));
@@ -252,21 +298,19 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     finalHeaders.set('Accept-Ranges', 'bytes');
     finalHeaders.set('X-Drive-API', 'true');
     finalHeaders.set('X-Account', String(accountIndex));
-    finalHeaders.set('Cache-Control', 'public, max-age=3600');
+    finalHeaders.set('Cache-Control', 'public, max-age=86400, immutable');
     addCorsHeaders(finalHeaders);
     
-    // Zero-copy stream (no buffering)
     return new Response(response.body, { status: 206, headers: finalHeaders });
   }
 
-  // Full response (200)
   const finalHeaders = new Headers();
   finalHeaders.set('Content-Type', response.headers.get('Content-Type') || mimeType);
   finalHeaders.set('Content-Disposition', buildContentDisposition(fileName));
   finalHeaders.set('Accept-Ranges', isGoogleDoc ? 'none' : 'bytes');
   finalHeaders.set('X-Drive-API', 'true');
   finalHeaders.set('X-Account', String(accountIndex));
-  finalHeaders.set('Cache-Control', 'public, max-age=3600');
+  finalHeaders.set('Cache-Control', 'public, max-age=86400');
   
   if (response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
@@ -283,8 +327,15 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   
   addCorsHeaders(finalHeaders);
   
-  // Zero-copy stream
   return new Response(response.body, { status: 200, headers: finalHeaders });
+}
+
+function isVideoMimeType(mimeType) {
+  return mimeType && (
+    mimeType.startsWith('video/') || 
+    mimeType === 'application/x-mpegURL' ||
+    mimeType === 'application/vnd.apple.mpegurl'
+  );
 }
 
 function buildExportUrl(fileId, mimeType) {
@@ -299,13 +350,9 @@ function buildExportUrl(fileId, mimeType) {
 
 function buildContentDisposition(fileName) {
   const safeAscii = fileName.replace(/[^\w.\- ]+/g, '_').slice(0, 200);
-  return `attachment; filename="${safeAscii}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+  return `inline; filename="${safeAscii}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
-/**
- * Cache API token storage (survives isolate restarts)
- * Saves 200-500ms per cold start
- */
 async function getGoogleAccessToken(serviceAccount, ctx) {
   const email = serviceAccount.client_email;
   const cache = caches.default;
@@ -354,7 +401,6 @@ async function getGoogleAccessToken(serviceAccount, ctx) {
     const tokenData = await tokenResponse.json();
     const token = tokenData.access_token;
     
-    // Cache for 50 minutes
     const cacheResp = new Response(token, {
       headers: { 'Cache-Control': 'max-age=3000' }
     });
@@ -420,14 +466,9 @@ function extractGoogleDriveId(url) {
   }
 }
 
-/**
- * Direct download path (HTTP-compliant)
- */
 async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
   const proxyHeaders = buildHeaders(request, parsedTarget, params);
-  const rangeHeader = request.headers.get('Range');
   
-  // HEAD: Use Range 0-0 trick for reliable size + range proof
   if (request.method === 'HEAD') {
     proxyHeaders.set('Range', 'bytes=0-0');
     const resp = await fetch(targetUrl, { 
@@ -454,14 +495,17 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     return new Response(null, { status: 200, headers });
   }
 
-  // GET
+  const isVideo = isVideoUrl(targetUrl);
   const response = await fetch(targetUrl, {
     method: 'GET',
     headers: proxyHeaders,
-    redirect: 'follow'
+    redirect: 'follow',
+    cf: {
+      cacheTtl: isVideo ? 86400 : 3600,
+      cacheEverything: isVideo
+    }
   });
 
-  // Detect quota error
   if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
     const text = await response.text();
     if (text.includes("Sorry, you can't view or download")) {
@@ -477,9 +521,8 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     if (response.status >= 500) return jsonResponse({ error: 'Origin error' }, 502);
   }
 
-  const finalHeaders = buildResponseHeaders(response);
+  const finalHeaders = buildResponseHeaders(response, isVideo);
   
-  // Ensure Content-Length
   if (response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
   }
@@ -489,7 +532,6 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
   }
   
-  // Zero-copy stream
   return new Response(response.body, { 
     status: response.status, 
     headers: finalHeaders 
@@ -514,7 +556,6 @@ function extractFilename(response, url) {
 function buildHeaders(request, target, params) {
   const headers = new Headers();
   
-  // CRITICAL: Forward Range header exactly
   ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'].forEach(h => {
     const value = request.headers.get(h);
     if (value) headers.set(h, value);
@@ -537,13 +578,19 @@ function buildHeaders(request, target, params) {
   return headers;
 }
 
-function buildResponseHeaders(response) {
+function buildResponseHeaders(response, isVideo) {
   const headers = new Headers(response.headers);
   addCorsHeaders(headers);
   
   if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
   headers.delete('Content-Encoding');
-  headers.set('Cache-Control', 'public, max-age=3600');
+  
+  // Aggressive caching for video content
+  if (isVideo) {
+    headers.set('Cache-Control', 'public, max-age=86400, immutable');
+  } else {
+    headers.set('Cache-Control', 'public, max-age=3600');
+  }
   
   ['Content-Security-Policy', 'X-Frame-Options', 'Set-Cookie'].forEach(h => headers.delete(h));
   return headers;
