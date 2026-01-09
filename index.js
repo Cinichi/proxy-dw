@@ -496,46 +496,67 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
   }
 
   const isVideo = isVideoUrl(targetUrl);
-  const response = await fetch(targetUrl, {
-    method: 'GET',
-    headers: proxyHeaders,
-    redirect: 'follow',
-    cf: {
-      cacheTtl: isVideo ? 86400 : 3600,
-      cacheEverything: isVideo
+  
+  try {
+    const response = await fetch(targetUrl, {
+      method: 'GET',
+      headers: proxyHeaders,
+      redirect: 'follow',
+      cf: {
+        cacheTtl: isVideo ? 86400 : 3600,
+        cacheEverything: isVideo
+      }
+    });
+
+    // Log for debugging
+    console.log(`Fetch ${targetUrl}: ${response.status}`);
+    
+    if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
+      const text = await response.text();
+      if (text.includes("Sorry, you can't view or download")) {
+        return jsonResponse({
+          error: 'Quota exceeded',
+          tip: 'Use ?api=true with service accounts'
+        }, 429);
+      }
+      // If we got HTML instead of video, return it as-is for debugging
+      return new Response(text, {
+        status: response.status,
+        headers: { 'Content-Type': 'text/html' }
+      });
     }
-  });
 
-  if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
-    const text = await response.text();
-    if (text.includes("Sorry, you can't view or download")) {
-      return jsonResponse({
-        error: 'Quota exceeded',
-        tip: 'Use ?api=true with service accounts'
-      }, 429);
+    if (!response.ok) {
+      console.error(`Failed to fetch: ${response.status} ${response.statusText}`);
+      if (response.status === 404) return jsonResponse({ error: 'Not found', url: targetUrl }, 404);
+      if (response.status === 403) return jsonResponse({ error: 'Access forbidden', url: targetUrl }, 403);
+      if (response.status >= 500) return jsonResponse({ error: 'Origin server error', status: response.status }, 502);
+      return jsonResponse({ error: `Request failed with status ${response.status}` }, response.status);
     }
-  }
 
-  if (!response.ok) {
-    if (response.status === 404) return jsonResponse({ error: 'Not found' }, 404);
-    if (response.status >= 500) return jsonResponse({ error: 'Origin error' }, 502);
+    const finalHeaders = buildResponseHeaders(response, isVideo);
+    
+    if (response.headers.has('Content-Length')) {
+      finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
+    }
+    
+    const filename = extractFilename(response, targetUrl);
+    if (filename && !finalHeaders.has('Content-Disposition')) {
+      finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
+    }
+    
+    return new Response(response.body, { 
+      status: response.status, 
+      headers: finalHeaders 
+    });
+  } catch (error) {
+    console.error('Fetch error:', error);
+    return jsonResponse({ 
+      error: 'Failed to fetch URL', 
+      details: error.message,
+      url: targetUrl 
+    }, 500);
   }
-
-  const finalHeaders = buildResponseHeaders(response, isVideo);
-  
-  if (response.headers.has('Content-Length')) {
-    finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
-  }
-  
-  const filename = extractFilename(response, targetUrl);
-  if (filename && !finalHeaders.has('Content-Disposition')) {
-    finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
-  }
-  
-  return new Response(response.body, { 
-    status: response.status, 
-    headers: finalHeaders 
-  });
 }
 
 function extractFilename(response, url) {
@@ -556,25 +577,33 @@ function extractFilename(response, url) {
 function buildHeaders(request, target, params) {
   const headers = new Headers();
   
+  // Forward range headers
   ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'].forEach(h => {
     const value = request.headers.get(h);
     if (value) headers.set(h, value);
   });
   
-  headers.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36');
+  // Use a real browser user agent
+  headers.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   headers.set('Accept', '*/*');
   headers.set('Connection', 'keep-alive');
+  
+  // Don't set Accept-Encoding to avoid compression issues
   
   const customReferer = params.get('referer');
   const customOrigin = params.get('origin');
   
-  if (target.hostname.includes('drive.google.com') || target.hostname.includes('drive.usercontent.google.com')) {
+  // Special handling for watchpeopledie.tv CDN
+  if (target.hostname.includes('watchpeopledie.tv')) {
+    headers.set('Referer', customReferer || 'https://watchpeopledie.tv/');
+    // Don't set Origin for CDN - may cause 403
+  } else if (target.hostname.includes('drive.google.com') || target.hostname.includes('drive.usercontent.google.com')) {
     headers.set('Referer', customReferer || 'https://drive.google.com/');
     headers.set('Origin', customOrigin || 'https://drive.google.com');
   } else {
     headers.set('Referer', customReferer || target.origin + '/');
-    headers.set('Origin', customOrigin || target.origin);
   }
+  
   return headers;
 }
 
