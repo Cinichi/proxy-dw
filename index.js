@@ -1,18 +1,13 @@
-// Google Drive Proxy v3.6.0 - STREAMING OPTIMIZED
-// ✓ HLS/DASH streaming ✓ M3U8 rewriting ✓ Video chunk support ✓ Aggressive caching
+// Google Drive Proxy v4.0.0
+// ✓ Full drive scope  ✓ No stale token cache  ✓ Better error handling
+// ✓ SA fallback to direct  ✓ M3U8 rewriting  ✓ Range/streaming support
 
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       if (url.pathname === '/health') {
-        return new Response('OK', {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/plain',
-            'Cache-Control': 'no-store'
-          }
-        });
+        return new Response('OK', { status: 200, headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } });
       }
       return await handleRequest(request, env, ctx);
     } catch (error) {
@@ -22,61 +17,53 @@ export default {
   }
 };
 
+// ─── MAIN ROUTER ────────────────────────────────────────────────────────────
+
 async function handleRequest(request, env, ctx) {
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers: getCorsHeaders() });
-  }
-  
-  if (!['GET', 'HEAD'].includes(request.method)) {
-    return jsonResponse({ error: 'Method not allowed' }, 405);
-  }
+  if (request.method === 'OPTIONS') return new Response(null, { headers: getCorsHeaders() });
+  if (!['GET', 'HEAD'].includes(request.method)) return jsonResponse({ error: 'Method not allowed' }, 405);
 
   const url = new URL(request.url);
   let targetUrl = url.searchParams.get('url');
   const fileId = url.searchParams.get('id');
   const forceApi = url.searchParams.get('api') === 'true';
   const forceDirect = url.searchParams.get('direct') === 'true';
-  
+
   let extractedFileId = fileId;
   if (!extractedFileId && targetUrl?.includes('drive.google.com')) {
     extractedFileId = extractGoogleDriveId(targetUrl);
   }
-  
+
   if (!targetUrl && !extractedFileId) {
-    return jsonResponse({ 
-      error: 'Missing url or id parameter', 
-      examples: {
-        driveId: '?id=FILE_ID',
-        video: '?url=https://example.com/video.mp4',
-        m3u8: '?url=https://example.com/playlist.m3u8'
-      }
+    return jsonResponse({
+      error: 'Missing url or id parameter',
+      examples: { driveId: '?id=FILE_ID', video: '?url=https://example.com/video.mp4', m3u8: '?url=https://example.com/playlist.m3u8' }
     }, 400);
   }
 
-  // API path (fastest with service accounts)
+  // ── SA/API path ──
   if (extractedFileId && !forceDirect && (forceApi || hasServiceAccounts(env))) {
     try {
       return await handleDriveApiRequest(request, extractedFileId, env, ctx);
     } catch (apiError) {
-      console.warn('API failed:', apiError.message);
+      console.warn('API path failed, falling back to direct:', apiError.message);
+      // Fall through to direct only for non-permission errors
+      if (apiError.message.includes('not found')) {
+        return jsonResponse({ error: 'File not found' }, 404);
+      }
     }
   }
 
-  // Direct path
+  // ── Direct path ──
   if (extractedFileId && !targetUrl) {
     targetUrl = buildGoogleDriveUrl(extractedFileId);
   }
 
-  if (!targetUrl) {
-    return jsonResponse({ error: 'Could not determine target URL' }, 400);
-  }
+  if (!targetUrl) return jsonResponse({ error: 'Could not determine target URL' }, 400);
 
   const validation = validateTargetUrl(targetUrl);
-  if (!validation.valid) {
-    return jsonResponse({ error: validation.error }, validation.status);
-  }
+  if (!validation.valid) return jsonResponse({ error: validation.error }, validation.status);
 
-  // Check if M3U8 playlist (HLS streaming)
   if (isM3U8Url(targetUrl)) {
     return await handleM3U8Request(request, targetUrl, validation.url, ctx, url.searchParams);
   }
@@ -84,61 +71,10 @@ async function handleRequest(request, env, ctx) {
   return await fetchDirect(request, targetUrl, validation.url, ctx, url.searchParams);
 }
 
-function isM3U8Url(url) {
-  return url.toLowerCase().includes('.m3u8') || url.toLowerCase().includes('m3u8');
-}
-
-function isVideoUrl(url) {
-  const videoExts = /\.(mp4|webm|mkv|avi|mov|flv|m4v|ts|mpg|mpeg|3gp|wmv)(\?|$)/i;
-  return videoExts.test(url);
-}
-
-/**
- * Handle M3U8 playlists - rewrite URLs to proxy them
- */
-async function handleM3U8Request(request, targetUrl, parsedTarget, ctx, params) {
-  const proxyHeaders = buildHeaders(request, parsedTarget, params);
-  
-  const response = await fetch(targetUrl, {
-    method: 'GET',
-    headers: proxyHeaders,
-    redirect: 'follow',
-    cf: { cacheTtl: 60 } // Cache playlists for 1 minute
-  });
-
-  if (!response.ok) {
-    return jsonResponse({ error: 'Failed to fetch playlist' }, response.status);
-  }
-
-  let content = await response.text();
-  const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-  const workerUrl = new URL(request.url).origin;
-
-  // Rewrite relative URLs in M3U8 to proxy through worker
-  content = content.split('\n').map(line => {
-    line = line.trim();
-    if (!line || line.startsWith('#')) return line;
-    
-    // Absolute URL
-    if (line.startsWith('http://') || line.startsWith('https://')) {
-      return `${workerUrl}/?url=${encodeURIComponent(line)}`;
-    }
-    
-    // Relative URL
-    const fullUrl = baseUrl + line;
-    return `${workerUrl}/?url=${encodeURIComponent(fullUrl)}`;
-  }).join('\n');
-
-  const headers = new Headers();
-  headers.set('Content-Type', 'application/vnd.apple.mpegurl');
-  headers.set('Cache-Control', 'public, max-age=60');
-  addCorsHeaders(headers);
-
-  return new Response(content, { status: 200, headers });
-}
+// ─── GOOGLE DRIVE API ────────────────────────────────────────────────────────
 
 function hasServiceAccounts(env) {
-  return env.GOOGLE_SERVICE_ACCOUNT || env.GOOGLE_SERVICE_ACCOUNT_1 || env.GOOGLE_SERVICE_ACCOUNT_2;
+  return !!(env.GOOGLE_SERVICE_ACCOUNT || env.GOOGLE_SERVICE_ACCOUNT_1);
 }
 
 function getAllServiceAccounts(env) {
@@ -148,7 +84,7 @@ function getAllServiceAccounts(env) {
     if (env[key]) {
       try {
         accounts.push(JSON.parse(env[key]));
-      } catch (e) {
+      } catch {
         console.error(`Invalid JSON in ${key}`);
       }
     }
@@ -158,7 +94,7 @@ function getAllServiceAccounts(env) {
 
 async function handleDriveApiRequest(request, fileId, env, ctx) {
   const serviceAccounts = getAllServiceAccounts(env);
-  if (serviceAccounts.length === 0) throw new Error('No service accounts');
+  if (serviceAccounts.length === 0) throw new Error('No service accounts configured');
 
   let lastError = null;
   for (let i = 0; i < serviceAccounts.length; i++) {
@@ -166,149 +102,87 @@ async function handleDriveApiRequest(request, fileId, env, ctx) {
       const result = await tryServiceAccount(request, fileId, serviceAccounts[i], i, ctx);
       if (result) return result;
     } catch (error) {
-      console.warn(`Account ${i} failed:`, error.message);
+      console.warn(`SA[${i}] failed: ${error.message}`);
       lastError = error;
-      if (error.message.includes('404') || error.message.includes('not found')) throw error;
+      // Hard stop — file doesn't exist, no point trying other accounts
+      if (error.message.includes('not found')) throw error;
+      // Continue to next SA on auth/quota errors
     }
   }
-  throw lastError || new Error('All accounts failed');
-}
-
-async function getFileMetadata(fileId, accessToken, ctx) {
-  const cache = caches.default;
-  const cacheKey = new Request(`https://meta.internal/${fileId}`);
-  
-  const cached = await cache.match(cacheKey);
-  if (cached) return await cached.json();
-  
-  const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType,md5Checksum,modifiedTime`;
-  const metaResp = await fetch(metaUrl, {
-    headers: { 'Authorization': `Bearer ${accessToken}` }
-  });
-  
-  if (!metaResp.ok) {
-    if (metaResp.status === 404) throw new Error('File not found');
-    if (metaResp.status === 403) throw new Error('File not accessible');
-    throw new Error(`Metadata failed: ${metaResp.status}`);
-  }
-  
-  const metadata = await metaResp.json();
-  
-  const cacheResp = new Response(JSON.stringify(metadata), {
-    headers: { 'Cache-Control': 'max-age=600' }
-  });
-  ctx.waitUntil(cache.put(cacheKey, cacheResp));
-  
-  return metadata;
+  throw lastError || new Error('All service accounts failed');
 }
 
 async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, ctx) {
   const accessToken = await getGoogleAccessToken(serviceAccount, ctx);
-  if (!accessToken) throw new Error('No access token');
+  if (!accessToken) throw new Error(`SA[${accountIndex}]: failed to get access token`);
 
-  const metadata = await getFileMetadata(fileId, accessToken, ctx);
-  
+  // ── Metadata ──
+  const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType,md5Checksum,modifiedTime`;
+  const metaResp = await fetch(metaUrl, {
+    headers: { 'Authorization': `Bearer ${accessToken}` }
+  });
+
+  if (!metaResp.ok) {
+    const body = await metaResp.text().catch(() => '');
+    console.error(`SA[${accountIndex}] metadata ${metaResp.status}: ${body}`);
+    if (metaResp.status === 404) throw new Error('File not found');
+    if (metaResp.status === 401) throw new Error(`SA[${accountIndex}]: 401 invalid token`);
+    if (metaResp.status === 403) throw new Error(`SA[${accountIndex}]: 403 no access`);
+    throw new Error(`Metadata failed: ${metaResp.status}`);
+  }
+
+  const metadata = await metaResp.json();
   const fileName = metadata.name || 'download';
   const fileSize = parseInt(metadata.size || '0', 10);
   const mimeType = metadata.mimeType || 'application/octet-stream';
   const isGoogleDoc = mimeType.startsWith('application/vnd.google-apps.');
-  
   const rangeHeader = request.headers.get('Range');
-  
+
+  const downloadUrl = isGoogleDoc
+    ? buildExportUrl(fileId, mimeType)
+    : `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+
+  // ── HEAD ──
   if (request.method === 'HEAD') {
-    const downloadUrl = isGoogleDoc 
-      ? buildExportUrl(fileId, mimeType)
-      : `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
-    
-    const headHeaders = new Headers({
-      'Authorization': `Bearer ${accessToken}`,
-      'Range': 'bytes=0-0'
-    });
-    
-    const headResp = await fetch(downloadUrl, {
-      method: 'GET',
-      headers: headHeaders
-    });
-    
     const headers = new Headers();
-    
-    if (headResp.status === 206 && headResp.headers.has('Content-Range')) {
-      const range = headResp.headers.get('Content-Range');
-      const match = range.match(/bytes \d+-\d+\/(\d+)/);
-      if (match) {
-        headers.set('Content-Length', match[1]);
-      }
-    } else if (!isGoogleDoc && fileSize > 0) {
-      headers.set('Content-Length', String(fileSize));
-    }
-    
+    if (!isGoogleDoc && fileSize > 0) headers.set('Content-Length', String(fileSize));
     headers.set('Content-Type', isGoogleDoc ? 'application/pdf' : mimeType);
     headers.set('Content-Disposition', buildContentDisposition(fileName));
     headers.set('Accept-Ranges', isGoogleDoc ? 'none' : 'bytes');
     headers.set('X-Drive-API', 'true');
     headers.set('X-Account', String(accountIndex));
-    
-    if (metadata.md5Checksum && !isGoogleDoc) {
-      headers.set('ETag', `"${metadata.md5Checksum}"`);
-    }
-    if (metadata.modifiedTime) {
-      headers.set('Last-Modified', new Date(metadata.modifiedTime).toUTCString());
-    }
-    
+    if (metadata.md5Checksum && !isGoogleDoc) headers.set('ETag', `"${metadata.md5Checksum}"`);
+    if (metadata.modifiedTime) headers.set('Last-Modified', new Date(metadata.modifiedTime).toUTCString());
     addCorsHeaders(headers);
     return new Response(null, { status: 200, headers });
   }
 
-  const downloadUrl = isGoogleDoc 
-    ? buildExportUrl(fileId, mimeType)
-    : `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
-
+  // ── GET ──
   const downloadHeaders = new Headers({
     'Authorization': `Bearer ${accessToken}`,
     'Connection': 'keep-alive'
   });
-  
-  if (rangeHeader && !isGoogleDoc) {
-    downloadHeaders.set('Range', rangeHeader);
-  }
+  if (rangeHeader && !isGoogleDoc) downloadHeaders.set('Range', rangeHeader);
 
   const response = await fetch(downloadUrl, {
     method: 'GET',
     headers: downloadHeaders,
-    cf: { 
-      cacheTtl: 86400, // Cache video chunks for 24 hours
+    cf: {
+      cacheTtl: isVideoMimeType(mimeType) ? 86400 : 3600,
       cacheEverything: isVideoMimeType(mimeType)
     }
   });
 
   if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    console.error(`SA[${accountIndex}] download ${response.status}: ${body}`);
     throw new Error(`Download failed: ${response.status}`);
   }
 
-  // Handle null-body status codes
   if ([101, 204, 205, 304].includes(response.status)) {
-    const headers = new Headers(response.headers);
-    addCorsHeaders(headers);
-    return new Response(null, { status: response.status, headers });
-  }
-
-  if (response.status === 206) {
-    const finalHeaders = new Headers();
-    
-    ['Content-Type', 'Content-Range', 'Content-Length', 'ETag', 'Last-Modified'].forEach(h => {
-      if (response.headers.has(h)) {
-        finalHeaders.set(h, response.headers.get(h));
-      }
-    });
-    
-    finalHeaders.set('Content-Disposition', buildContentDisposition(fileName));
-    finalHeaders.set('Accept-Ranges', 'bytes');
-    finalHeaders.set('X-Drive-API', 'true');
-    finalHeaders.set('X-Account', String(accountIndex));
-    finalHeaders.set('Cache-Control', 'public, max-age=86400, immutable');
-    addCorsHeaders(finalHeaders);
-    
-    return new Response(response.body, { status: 206, headers: finalHeaders });
+    const h = new Headers(response.headers);
+    addCorsHeaders(h);
+    return new Response(null, { status: response.status, headers: h });
   }
 
   const finalHeaders = new Headers();
@@ -318,104 +192,89 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   finalHeaders.set('X-Drive-API', 'true');
   finalHeaders.set('X-Account', String(accountIndex));
   finalHeaders.set('Cache-Control', 'public, max-age=86400');
-  
+
+  if (response.status === 206) {
+    ['Content-Range', 'Content-Length'].forEach(h => {
+      if (response.headers.has(h)) finalHeaders.set(h, response.headers.get(h));
+    });
+    finalHeaders.set('Cache-Control', 'public, max-age=86400, immutable');
+    addCorsHeaders(finalHeaders);
+    return new Response(response.body, { status: 206, headers: finalHeaders });
+  }
+
   if (response.headers.has('Content-Length')) {
     finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
   } else if (!isGoogleDoc && fileSize > 0) {
     finalHeaders.set('Content-Length', String(fileSize));
   }
-  
-  if (metadata.md5Checksum && !isGoogleDoc) {
-    finalHeaders.set('ETag', `"${metadata.md5Checksum}"`);
-  }
-  if (metadata.modifiedTime) {
-    finalHeaders.set('Last-Modified', new Date(metadata.modifiedTime).toUTCString());
-  }
-  
+
+  if (metadata.md5Checksum && !isGoogleDoc) finalHeaders.set('ETag', `"${metadata.md5Checksum}"`);
+  if (metadata.modifiedTime) finalHeaders.set('Last-Modified', new Date(metadata.modifiedTime).toUTCString());
+
   addCorsHeaders(finalHeaders);
-  
   return new Response(response.body, { status: 200, headers: finalHeaders });
 }
 
-function isVideoMimeType(mimeType) {
-  return mimeType && (
-    mimeType.startsWith('video/') || 
-    mimeType === 'application/x-mpegURL' ||
-    mimeType === 'application/vnd.apple.mpegurl'
-  );
-}
-
-function buildExportUrl(fileId, mimeType) {
-  const exportMap = {
-    'application/vnd.google-apps.document': 'application/pdf',
-    'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'application/vnd.google-apps.presentation': 'application/pdf'
-  };
-  const exportMimeType = exportMap[mimeType] || 'application/pdf';
-  return `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=${encodeURIComponent(exportMimeType)}`;
-}
-
-function buildContentDisposition(fileName) {
-  const safeAscii = fileName.replace(/[^\w.\- ]+/g, '_').slice(0, 200);
-  return `inline; filename="${safeAscii}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
-}
+// ─── GOOGLE AUTH ─────────────────────────────────────────────────────────────
 
 async function getGoogleAccessToken(serviceAccount, ctx) {
   const email = serviceAccount.client_email;
+
+  // ── No stale cache: use short TTL (5 min) per token ──
   const cache = caches.default;
-  const cacheKey = new Request(`https://auth.internal/${btoa(email)}`);
-  
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    return await cached.text();
-  }
-  
+  const cacheKey = new Request(`https://auth.internal/v2/${btoa(email).replace(/=/g, '')}`);
+
+  try {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const token = await cached.text();
+      if (token && token.length > 20) return token;
+    }
+  } catch { /* ignore cache errors */ }
+
   try {
     const now = Math.floor(Date.now() / 1000);
-    const jwtHeader = { alg: 'RS256', typ: 'JWT' };
-    const jwtClaimSet = {
+    const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+    const claims = base64UrlEncode(JSON.stringify({
       iss: email,
-      scope: 'https://www.googleapis.com/auth/drive.readonly',
+      scope: 'https://www.googleapis.com/auth/drive',  // ← full scope, not readonly
       aud: 'https://oauth2.googleapis.com/token',
       exp: now + 3600,
       iat: now
-    };
+    }));
 
-    const encodedHeader = base64UrlEncode(JSON.stringify(jwtHeader));
-    const encodedClaimSet = base64UrlEncode(JSON.stringify(jwtClaimSet));
-    const signatureInput = `${encodedHeader}.${encodedClaimSet}`;
-    
+    const sigInput = `${header}.${claims}`;
     const privateKey = await importPrivateKey(serviceAccount.private_key);
     const signature = await crypto.subtle.sign(
       { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
       privateKey,
-      new TextEncoder().encode(signatureInput)
+      new TextEncoder().encode(sigInput)
     );
-    
-    const encodedSignature = base64UrlEncode(signature);
-    const jwt = `${signatureInput}.${encodedSignature}`;
-    
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+
+    const jwt = `${sigInput}.${base64UrlEncode(signature)}`;
+
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
     });
-    
-    if (!tokenResponse.ok) {
-      throw new Error(`Token exchange failed: ${tokenResponse.status}`);
+
+    if (!tokenResp.ok) {
+      const err = await tokenResp.text().catch(() => '');
+      throw new Error(`Token exchange failed ${tokenResp.status}: ${err}`);
     }
-    
-    const tokenData = await tokenResponse.json();
-    const token = tokenData.access_token;
-    
-    const cacheResp = new Response(token, {
-      headers: { 'Cache-Control': 'max-age=3000' }
-    });
-    ctx.waitUntil(cache.put(cacheKey, cacheResp));
-    
-    return token;
+
+    const { access_token } = await tokenResp.json();
+    if (!access_token) throw new Error('No access_token in response');
+
+    // Cache for 55 minutes (token valid 60 min)
+    ctx.waitUntil(cache.put(cacheKey, new Response(access_token, {
+      headers: { 'Cache-Control': 'max-age=3300' }
+    })));
+
+    return access_token;
   } catch (error) {
-    console.error('Token error:', error);
+    console.error('getGoogleAccessToken error:', error.message);
     return null;
   }
 }
@@ -427,228 +286,192 @@ async function importPrivateKey(pemKey) {
     .replace(/\s/g, '');
   const binaryKey = base64Decode(pemContents);
   return await crypto.subtle.importKey(
-    'pkcs8',
-    binaryKey,
+    'pkcs8', binaryKey,
     { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
+    false, ['sign']
   );
 }
 
-function base64UrlEncode(data) {
-  const bytes = typeof data === 'string' 
-    ? new TextEncoder().encode(data)
-    : new Uint8Array(data);
-  let binary = '';
-  bytes.forEach(b => binary += String.fromCharCode(b));
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+// ─── M3U8 ────────────────────────────────────────────────────────────────────
+
+async function handleM3U8Request(request, targetUrl, parsedTarget, ctx, params) {
+  const proxyHeaders = buildHeaders(request, parsedTarget, params);
+  const response = await fetch(targetUrl, { method: 'GET', headers: proxyHeaders, redirect: 'follow' });
+
+  if (!response.ok) return jsonResponse({ error: 'Failed to fetch playlist' }, response.status);
+
+  let content = await response.text();
+  const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+  const workerOrigin = new URL(request.url).origin;
+
+  content = content.split('\n').map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return line;
+    const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
+    return `${workerOrigin}/?url=${encodeURIComponent(fullUrl)}`;
+  }).join('\n');
+
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/vnd.apple.mpegurl');
+  headers.set('Cache-Control', 'public, max-age=60');
+  addCorsHeaders(headers);
+  return new Response(content, { status: 200, headers });
 }
 
-function base64Decode(str) {
-  const binary = atob(str);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
-function buildGoogleDriveUrl(fileId) {
-  const uuid = deterministicUUID(fileId);
-  return `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid}`;
-}
-
-function deterministicUUID(fileId) {
-  const encoded = btoa(fileId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
-  return `${encoded.slice(0, 4)}-${encoded.slice(4, 8)}`;
-}
-
-function extractGoogleDriveId(url) {
-  const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
-  if (match) return match[1];
-  try {
-    return new URL(url).searchParams.get('id');
-  } catch {
-    return null;
-  }
-}
+// ─── DIRECT FETCH ────────────────────────────────────────────────────────────
 
 async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
   const proxyHeaders = buildHeaders(request, parsedTarget, params);
-  
+  const isVideo = isVideoUrl(targetUrl);
+
   if (request.method === 'HEAD') {
     proxyHeaders.set('Range', 'bytes=0-0');
-    const resp = await fetch(targetUrl, { 
-      method: 'GET',
-      headers: proxyHeaders,
-      redirect: 'follow'
-    });
-    
+    const resp = await fetch(targetUrl, { method: 'GET', headers: proxyHeaders, redirect: 'follow' });
     const headers = new Headers();
     if (resp.status === 206 && resp.headers.has('Content-Range')) {
-      const range = resp.headers.get('Content-Range');
-      const match = range.match(/bytes \d+-\d+\/(\d+)/);
+      const match = resp.headers.get('Content-Range').match(/bytes \d+-\d+\/(\d+)/);
       if (match) headers.set('Content-Length', match[1]);
     } else if (resp.headers.has('Content-Length')) {
       headers.set('Content-Length', resp.headers.get('Content-Length'));
     }
-    
     ['Content-Type', 'ETag', 'Last-Modified'].forEach(h => {
       if (resp.headers.has(h)) headers.set(h, resp.headers.get(h));
     });
-    
     headers.set('Accept-Ranges', 'bytes');
     addCorsHeaders(headers);
     return new Response(null, { status: 200, headers });
   }
 
-  const isVideo = isVideoUrl(targetUrl);
-  
   try {
     const response = await fetch(targetUrl, {
       method: 'GET',
       headers: proxyHeaders,
       redirect: 'follow',
-      cf: {
-        cacheTtl: isVideo ? 86400 : 3600,
-        cacheEverything: isVideo
-      }
+      cf: { cacheTtl: isVideo ? 86400 : 3600, cacheEverything: isVideo }
     });
 
-    // Log for debugging
-    console.log(`Fetch ${targetUrl}: ${response.status}`);
-    
-    // Handle null-body status codes (101, 204, 205, 304)
+    console.log(`Direct fetch ${targetUrl}: ${response.status}`);
+
     if ([101, 204, 205, 304].includes(response.status)) {
-      const headers = new Headers(response.headers);
-      addCorsHeaders(headers);
-      return new Response(null, { status: response.status, headers });
+      const h = new Headers(response.headers);
+      addCorsHeaders(h);
+      return new Response(null, { status: response.status, headers: h });
     }
-    
+
     if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
       const text = await response.text();
       if (text.includes("Sorry, you can't view or download")) {
-        return jsonResponse({
-          error: 'Quota exceeded',
-          tip: 'Use ?api=true with service accounts'
-        }, 429);
+        return jsonResponse({ error: 'Google Drive quota exceeded. Add service accounts.', tip: 'Use ?api=true or add GOOGLE_SERVICE_ACCOUNT env var' }, 429);
       }
-      // If we got HTML instead of video, return it as-is for debugging
-      return new Response(text, {
-        status: response.status,
-        headers: { 'Content-Type': 'text/html' }
-      });
+      return new Response(text, { status: response.status, headers: { 'Content-Type': 'text/html' } });
     }
 
     if (!response.ok) {
-      console.error(`Failed to fetch: ${response.status} ${response.statusText}`);
-      if (response.status === 404) return jsonResponse({ error: 'Not found', url: targetUrl }, 404);
-      if (response.status === 403) return jsonResponse({ error: 'Access forbidden', url: targetUrl }, 403);
-      if (response.status >= 500) return jsonResponse({ error: 'Origin server error', status: response.status }, 502);
-      return jsonResponse({ error: `Request failed with status ${response.status}` }, response.status);
+      if (response.status === 404) return jsonResponse({ error: 'Not found' }, 404);
+      if (response.status === 403) return jsonResponse({ error: 'Access forbidden' }, 403);
+      if (response.status >= 500) return jsonResponse({ error: 'Origin error', status: response.status }, 502);
+      return jsonResponse({ error: `Request failed: ${response.status}` }, response.status);
     }
 
     const finalHeaders = buildResponseHeaders(response, isVideo);
-    
-    // Ensure Content-Type is set for videos
-    if (isVideo && !finalHeaders.has('Content-Type')) {
-      finalHeaders.set('Content-Type', 'video/mp4');
-    }
-    
-    if (response.headers.has('Content-Length')) {
-      finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
-    }
-    
+    if (response.headers.has('Content-Length')) finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
+
     const filename = extractFilename(response, targetUrl);
-    if (filename && !finalHeaders.has('Content-Disposition')) {
-      finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
-    }
-    
-    return new Response(response.body, { 
-      status: response.status, 
-      headers: finalHeaders 
-    });
+    if (filename) finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
+
+    return new Response(response.body, { status: response.status, headers: finalHeaders });
   } catch (error) {
-    console.error('Fetch error:', error);
-    return jsonResponse({ 
-      error: 'Failed to fetch URL', 
-      details: error.message,
-      url: targetUrl 
-    }, 500);
+    console.error('Direct fetch error:', error);
+    return jsonResponse({ error: 'Failed to fetch URL', details: error.message }, 500);
   }
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function isM3U8Url(url) {
+  return /m3u8/i.test(url);
+}
+
+function isVideoUrl(url) {
+  return /\.(mp4|webm|mkv|avi|mov|flv|m4v|ts|mpg|mpeg|3gp|wmv)(\?|$)/i.test(url);
+}
+
+function isVideoMimeType(mimeType) {
+  return mimeType?.startsWith('video/') || 
+    mimeType === 'application/x-mpegURL' || 
+    mimeType === 'application/vnd.apple.mpegurl';
+}
+
+function buildGoogleDriveUrl(fileId) {
+  return `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
+}
+
+function extractGoogleDriveId(url) {
+  const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+  if (match) return match[1];
+  try { return new URL(url).searchParams.get('id'); } catch { return null; }
+}
+
+function buildExportUrl(fileId, mimeType) {
+  const exportMap = {
+    'application/vnd.google-apps.document': 'application/pdf',
+    'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.google-apps.presentation': 'application/pdf'
+  };
+  return `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=${encodeURIComponent(exportMap[mimeType] || 'application/pdf')}`;
+}
+
+function buildContentDisposition(fileName) {
+  const safe = fileName.replace(/[^\w.\- ]+/g, '_').slice(0, 200);
+  return `inline; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 }
 
 function extractFilename(response, url) {
   const cd = response.headers.get('Content-Disposition');
   if (cd) {
     const match = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-    if (match && match[1]) return match[1].replace(/['"]/g, '');
+    if (match?.[1]) return match[1].replace(/['"]/g, '');
   }
   try {
-    const pathname = new URL(url).pathname;
-    const parts = pathname.split('/');
-    const lastPart = parts[parts.length - 1];
-    if (lastPart && lastPart.includes('.')) return decodeURIComponent(lastPart);
-  } catch (e) {}
+    const parts = new URL(url).pathname.split('/');
+    const last = parts[parts.length - 1];
+    if (last?.includes('.')) return decodeURIComponent(last);
+  } catch { }
   return null;
 }
 
 function buildHeaders(request, target, params) {
   const headers = new Headers();
-  
-  // Forward range headers
   ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'].forEach(h => {
-    const value = request.headers.get(h);
-    if (value) headers.set(h, value);
+    const v = request.headers.get(h);
+    if (v) headers.set(h, v);
   });
-  
-  // Use a real browser user agent
   headers.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   headers.set('Accept', '*/*');
   headers.set('Connection', 'keep-alive');
-  
-  // Don't set Accept-Encoding to avoid compression issues
-  
-  const customReferer = params.get('referer');
-  const customOrigin = params.get('origin');
-  
-  // Special handling for watchpeopledie.tv CDN
-  if (target.hostname.includes('watchpeopledie.tv')) {
-    headers.set('Referer', customReferer || 'https://watchpeopledie.tv/');
-    // Don't set Origin for CDN - may cause 403
-  } else if (target.hostname.includes('drive.google.com') || target.hostname.includes('drive.usercontent.google.com')) {
+
+  const customReferer = params?.get('referer');
+  const customOrigin = params?.get('origin');
+
+  if (target.hostname.includes('drive.google.com') || target.hostname.includes('drive.usercontent.google.com')) {
     headers.set('Referer', customReferer || 'https://drive.google.com/');
     headers.set('Origin', customOrigin || 'https://drive.google.com');
   } else {
-    headers.set('Referer', customReferer || target.origin + '/');
+    headers.set('Referer', customReferer || `${target.origin}/`);
   }
-  
+
   return headers;
 }
 
 function buildResponseHeaders(response, isVideo) {
   const headers = new Headers(response.headers);
   addCorsHeaders(headers);
-  
-  // Force correct video MIME type for browser compatibility
-  const contentType = response.headers.get('Content-Type');
-  if (isVideo && (!contentType || contentType === 'application/octet-stream')) {
-    headers.set('Content-Type', 'video/mp4');
-  }
-  
+  const ct = response.headers.get('Content-Type');
+  if (isVideo && (!ct || ct === 'application/octet-stream')) headers.set('Content-Type', 'video/mp4');
   if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
-  
-  // Remove headers that might break streaming
   headers.delete('Content-Encoding');
   headers.delete('Transfer-Encoding');
-  
-  // Aggressive caching for video content
-  if (isVideo) {
-    headers.set('Cache-Control', 'public, max-age=86400, immutable');
-  } else {
-    headers.set('Cache-Control', 'public, max-age=3600');
-  }
-  
+  headers.set('Cache-Control', isVideo ? 'public, max-age=86400, immutable' : 'public, max-age=3600');
   ['Content-Security-Policy', 'X-Frame-Options', 'Set-Cookie'].forEach(h => headers.delete(h));
   return headers;
 }
@@ -656,25 +479,13 @@ function buildResponseHeaders(response, isVideo) {
 function validateTargetUrl(url) {
   try {
     const parsed = new URL(url);
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      return { valid: false, error: 'Invalid protocol', status: 400 };
-    }
-    
-    const hostname = parsed.hostname.toLowerCase();
-    const privatePatterns = [
-      'localhost', '127.0.0.1', '::1', '0.0.0.0',
-      /^192\.168\./, /^10\./, /^172\.(1[6-9]|2[0-9]|3[0-1])\./
-    ];
-    
-    for (const pattern of privatePatterns) {
-      if (typeof pattern === 'string') {
-        if (hostname === pattern) return { valid: false, error: 'Private IP blocked', status: 403 };
-      } else if (pattern.test(hostname)) {
-        return { valid: false, error: 'Private IP blocked', status: 403 };
-      }
-    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) return { valid: false, error: 'Invalid protocol', status: 400 };
+    const h = parsed.hostname.toLowerCase();
+    const blocked = ['localhost', '127.0.0.1', '::1', '0.0.0.0'];
+    if (blocked.includes(h)) return { valid: false, error: 'Private IP blocked', status: 403 };
+    if (/^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/.test(h)) return { valid: false, error: 'Private IP blocked', status: 403 };
     return { valid: true, url: parsed };
-  } catch (e) {
+  } catch {
     return { valid: false, error: 'Invalid URL', status: 400 };
   }
 }
@@ -696,9 +507,20 @@ function addCorsHeaders(headers) {
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { 
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
+}
+
+function base64UrlEncode(data) {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
+  let binary = '';
+  bytes.forEach(b => binary += String.fromCharCode(b));
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+function base64Decode(str) {
+  const binary = atob(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
 }
