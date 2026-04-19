@@ -401,10 +401,18 @@ async function handleM3U8Request(request, targetUrl, parsedTarget, ctx, params) 
 async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
   const proxyHeaders = buildHeaders(request, parsedTarget, params);
   const isVideo = isVideoUrl(targetUrl);
+  const rangeHeader = request.headers.get('Range');
 
+  // ── HEAD: probe file size without downloading ────────────────────────────
   if (request.method === 'HEAD') {
+    // Try Range probe first — more reliable for getting true Content-Length
     proxyHeaders.set('Range', 'bytes=0-0');
-    const resp = await fetch(targetUrl, { method: 'GET', headers: proxyHeaders, redirect: 'follow' });
+    const resp = await fetch(targetUrl, {
+      method: 'GET',
+      headers: proxyHeaders,
+      redirect: 'follow',
+      cf: { cacheTtl: 3600 }
+    });
     const headers = new Headers();
     if (resp.status === 206 && resp.headers.has('Content-Range')) {
       const match = resp.headers.get('Content-Range').match(/bytes \d+-\d+\/(\d+)/);
@@ -417,25 +425,47 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     });
     headers.set('Accept-Ranges', 'bytes');
     addCorsHeaders(headers);
+    // Cancel the body — we don't need it
+    resp.body?.cancel();
     return new Response(null, { status: 200, headers });
   }
 
-  try {
-    const rangeHeader = request.headers.get('Range');
+  // ── Conditional request — return 304 if client has it cached ────────────
+  // Client sends If-None-Match (ETag) or If-Modified-Since
+  // If origin agrees, we get 304 = zero bytes transferred
+  const ifNoneMatch = request.headers.get('If-None-Match');
+  const ifModifiedSince = request.headers.get('If-Modified-Since');
+  if (ifNoneMatch) proxyHeaders.set('If-None-Match', ifNoneMatch);
+  if (ifModifiedSince) proxyHeaders.set('If-Modified-Since', ifModifiedSince);
 
+  try {
     const response = await fetch(targetUrl, {
       method: 'GET',
       headers: proxyHeaders,
       redirect: 'follow',
       cf: {
+        // Videos cached 24h at CF edge — second request is instant
         cacheTtl: isVideo ? 86400 : 3600,
         cacheEverything: isVideo,
-        // ── OPTIMIZATION 6: Range-aware cache key for direct fetches too ──────
-        cacheKey: rangeHeader ? `${targetUrl}__${rangeHeader}` : targetUrl,
+        // ── KEY: Range-aware cache key ───────────────────────────────────
+        // Without this, CF stores the full file under one key
+        // and can't serve byte-range chunks from cache.
+        // With this, each chunk (e.g. bytes=0-1048575) is its own cache entry
+        // so video seeking loads instantly on second play.
+        cacheKey: rangeHeader
+          ? `${targetUrl}__${rangeHeader}`
+          : targetUrl,
       }
     });
 
-    if ([101, 204, 205, 304].includes(response.status)) {
+    // 304 Not Modified — client cache is valid, return immediately
+    if (response.status === 304) {
+      const h = new Headers();
+      addCorsHeaders(h);
+      return new Response(null, { status: 304, headers: h });
+    }
+
+    if ([101, 204, 205].includes(response.status)) {
       const h = new Headers(response.headers);
       addCorsHeaders(h);
       return new Response(null, { status: response.status, headers: h });
@@ -457,16 +487,48 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     }
 
     const finalHeaders = buildResponseHeaders(response, isVideo);
-    if (response.headers.has('Content-Length')) finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
+
+    // Always set Content-Length so browser shows progress bar
+    if (response.headers.has('Content-Length')) {
+      finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
+    }
+
+    // Forward ETag + Last-Modified so browser can cache and send conditional reqs
+    if (response.headers.has('ETag')) finalHeaders.set('ETag', response.headers.get('ETag'));
+    if (response.headers.has('Last-Modified')) finalHeaders.set('Last-Modified', response.headers.get('Last-Modified'));
+
+    // Forward Content-Range for 206 partial responses
+    if (response.status === 206 && response.headers.has('Content-Range')) {
+      finalHeaders.set('Content-Range', response.headers.get('Content-Range'));
+    }
 
     const filename = extractFilename(response, targetUrl);
     if (filename) finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
 
+    // Stream body directly — no buffering, no .text()/.arrayBuffer()
     return new Response(response.body, { status: response.status, headers: finalHeaders });
+
   } catch (error) {
     console.error('Direct fetch error:', error);
     return jsonResponse({ error: 'Failed to fetch URL', details: error.message }, 500);
   }
+}
+
+function buildResponseHeaders(response, isVideo) {
+  const headers = new Headers(response.headers);
+  addCorsHeaders(headers);
+  const ct = response.headers.get('Content-Type');
+  if (isVideo && (!ct || ct === 'application/octet-stream')) {
+    headers.set('Content-Type', 'video/mp4');
+  }
+  if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
+  // Strip these — they break streaming and cause re-encoding
+  headers.delete('Content-Encoding');
+  headers.delete('Transfer-Encoding');
+  // Strip security headers that block embedding
+  ['Content-Security-Policy', 'X-Frame-Options', 'Set-Cookie'].forEach(h => headers.delete(h));
+  headers.set('Cache-Control', isVideo ? 'public, max-age=86400, immutable' : 'public, max-age=3600');
+  return headers;
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
