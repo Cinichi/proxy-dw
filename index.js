@@ -1,7 +1,4 @@
-// Google Drive Proxy v4.0.0
-// ✓ Full drive scope  ✓ No stale token cache  ✓ Better error handling
-// ✓ SA fallback to direct  ✓ M3U8 rewriting  ✓ Range/streaming support
-
+// Google Drive Proxy v4.1.0
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -17,13 +14,85 @@ export default {
   }
 };
 
-// ─── MAIN ROUTER ────────────────────────────────────────────────────────────
-
 async function handleRequest(request, env, ctx) {
   if (request.method === 'OPTIONS') return new Response(null, { headers: getCorsHeaders() });
   if (!['GET', 'HEAD'].includes(request.method)) return jsonResponse({ error: 'Method not allowed' }, 405);
 
   const url = new URL(request.url);
+
+  // ─── DEBUG ENDPOINT ──────────────────────────────────────────────────────
+  if (url.pathname === '/debug') {
+    const fileId = url.searchParams.get('id');
+    if (!fileId) return jsonResponse({ error: 'add ?id=FILE_ID' }, 400);
+
+    const accounts = getAllServiceAccounts(env);
+    if (accounts.length === 0) return jsonResponse({ error: 'No SA found in env', hint: 'Add GOOGLE_SERVICE_ACCOUNT env var in Cloudflare Worker settings' }, 500);
+
+    const sa = accounts[0];
+    const results = {
+      sa_email: sa.client_email,
+      sa_project: sa.project_id,
+      total_accounts: accounts.length,
+      token: null,
+      token_error: null,
+      metadata: null,
+      metadata_error: null,
+      metadata_raw_status: null
+    };
+
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+      const claims = base64UrlEncode(JSON.stringify({
+        iss: sa.client_email,
+        scope: 'https://www.googleapis.com/auth/drive',
+        aud: 'https://oauth2.googleapis.com/token',
+        exp: now + 3600,
+        iat: now
+      }));
+      const sigInput = `${header}.${claims}`;
+      const privateKey = await importPrivateKey(sa.private_key);
+      const signature = await crypto.subtle.sign(
+        { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+        privateKey,
+        new TextEncoder().encode(sigInput)
+      );
+      const jwt = `${sigInput}.${base64UrlEncode(signature)}`;
+
+      const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+      });
+
+      const tokenBody = await tokenResp.json();
+      if (tokenResp.ok) {
+        results.token = tokenBody.access_token?.slice(0, 30) + '...';
+      } else {
+        results.token_error = tokenBody;
+      }
+
+      if (tokenBody.access_token) {
+        const metaResp = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType`,
+          { headers: { 'Authorization': `Bearer ${tokenBody.access_token}` } }
+        );
+        results.metadata_raw_status = metaResp.status;
+        const metaBody = await metaResp.json();
+        if (metaResp.ok) {
+          results.metadata = metaBody;
+        } else {
+          results.metadata_error = metaBody;
+        }
+      }
+    } catch (e) {
+      results.token_error = e.message;
+    }
+
+    return jsonResponse(results, 200);
+  }
+  // ─── END DEBUG ───────────────────────────────────────────────────────────
+
   let targetUrl = url.searchParams.get('url');
   const fileId = url.searchParams.get('id');
   const forceApi = url.searchParams.get('api') === 'true';
@@ -47,7 +116,6 @@ async function handleRequest(request, env, ctx) {
       return await handleDriveApiRequest(request, extractedFileId, env, ctx);
     } catch (apiError) {
       console.warn('API path failed, falling back to direct:', apiError.message);
-      // Fall through to direct only for non-permission errors
       if (apiError.message.includes('not found')) {
         return jsonResponse({ error: 'File not found' }, 404);
       }
@@ -104,9 +172,7 @@ async function handleDriveApiRequest(request, fileId, env, ctx) {
     } catch (error) {
       console.warn(`SA[${i}] failed: ${error.message}`);
       lastError = error;
-      // Hard stop — file doesn't exist, no point trying other accounts
       if (error.message.includes('not found')) throw error;
-      // Continue to next SA on auth/quota errors
     }
   }
   throw lastError || new Error('All service accounts failed');
@@ -116,7 +182,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   const accessToken = await getGoogleAccessToken(serviceAccount, ctx);
   if (!accessToken) throw new Error(`SA[${accountIndex}]: failed to get access token`);
 
-  // ── Metadata ──
   const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType,md5Checksum,modifiedTime`;
   const metaResp = await fetch(metaUrl, {
     headers: { 'Authorization': `Bearer ${accessToken}` }
@@ -219,8 +284,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
 
 async function getGoogleAccessToken(serviceAccount, ctx) {
   const email = serviceAccount.client_email;
-
-  // ── No stale cache: use short TTL (5 min) per token ──
   const cache = caches.default;
   const cacheKey = new Request(`https://auth.internal/v2/${btoa(email).replace(/=/g, '')}`);
 
@@ -230,14 +293,14 @@ async function getGoogleAccessToken(serviceAccount, ctx) {
       const token = await cached.text();
       if (token && token.length > 20) return token;
     }
-  } catch { /* ignore cache errors */ }
+  } catch { /* ignore */ }
 
   try {
     const now = Math.floor(Date.now() / 1000);
     const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const claims = base64UrlEncode(JSON.stringify({
       iss: email,
-      scope: 'https://www.googleapis.com/auth/drive',  // ← full scope, not readonly
+      scope: 'https://www.googleapis.com/auth/drive',
       aud: 'https://oauth2.googleapis.com/token',
       exp: now + 3600,
       iat: now
@@ -267,7 +330,6 @@ async function getGoogleAccessToken(serviceAccount, ctx) {
     const { access_token } = await tokenResp.json();
     if (!access_token) throw new Error('No access_token in response');
 
-    // Cache for 55 minutes (token valid 60 min)
     ctx.waitUntil(cache.put(cacheKey, new Response(access_token, {
       headers: { 'Cache-Control': 'max-age=3300' }
     })));
@@ -361,7 +423,7 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     if (response.ok && response.headers.get('content-type')?.includes('text/html')) {
       const text = await response.text();
       if (text.includes("Sorry, you can't view or download")) {
-        return jsonResponse({ error: 'Google Drive quota exceeded. Add service accounts.', tip: 'Use ?api=true or add GOOGLE_SERVICE_ACCOUNT env var' }, 429);
+        return jsonResponse({ error: 'Google Drive quota exceeded', tip: 'Add GOOGLE_SERVICE_ACCOUNT env var' }, 429);
       }
       return new Response(text, { status: response.status, headers: { 'Content-Type': 'text/html' } });
     }
@@ -397,8 +459,8 @@ function isVideoUrl(url) {
 }
 
 function isVideoMimeType(mimeType) {
-  return mimeType?.startsWith('video/') || 
-    mimeType === 'application/x-mpegURL' || 
+  return mimeType?.startsWith('video/') ||
+    mimeType === 'application/x-mpegURL' ||
     mimeType === 'application/vnd.apple.mpegurl';
 }
 
