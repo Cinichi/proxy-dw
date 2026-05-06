@@ -1,4 +1,4 @@
-// Google Drive Proxy v5.0.0 - MAXIMUM SPEED
+// Google Drive Proxy v5.1.0 - MAXIMUM SPEED + HEADERS SUPPORT
 // ─── WHAT'S OPTIMIZED ────────────────────────────────────────────────────────
 // 1. PARALLEL metadata+token fetch     → saves ~200-400ms per request
 // 2. In-memory key cache               → importPrivateKey is expensive, cache it
@@ -7,7 +7,8 @@
 // 5. Smart cache keys for range reqs   → chunks cached separately at CF edge
 // 6. Direct download URL bypass        → skip API for large files when possible
 // 7. Conditional requests (ETag)       → 304 means zero transfer
-// 8── ────────────────────────────────────────────────────────────────────────
+// 8. {headers} placeholder support     → forward custom headers from proxy URL
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request, env, ctx) {
@@ -129,8 +130,6 @@ async function handleDriveApiRequest(request, fileId, env, ctx) {
 
 async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, ctx) {
   // ── OPTIMIZATION 1: Fetch token + metadata IN PARALLEL ──────────────────────
-  // Old code: await token THEN await metadata = two sequential round-trips (~400ms)
-  // New code: both start at same time, total time = max(token, metadata) not sum
   const [accessToken, metadata] = await Promise.all([
     getGoogleAccessToken(serviceAccount, ctx),
     getCachedMetadata(fileId, serviceAccount, ctx)
@@ -145,11 +144,8 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   const isGDoc = mimeType.startsWith('application/vnd.google-apps.');
   const rangeHeader = request.headers.get('Range');
   const ifNoneMatch = request.headers.get('If-None-Match');
-  const ifModifiedSince = request.headers.get('If-Modified-Since');
 
   // ── OPTIMIZATION 2: Conditional 304 response ────────────────────────────────
-  // If client already has the file cached (sends ETag), return 304 instantly
-  // This means zero bytes transferred for repeat requests
   if (metadata.md5Checksum && ifNoneMatch === `"${metadata.md5Checksum}"`) {
     const h = new Headers();
     h.set('ETag', `"${metadata.md5Checksum}"`);
@@ -184,8 +180,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
   if (rangeHeader && !isGDoc) downloadHeaders.set('Range', rangeHeader);
 
   // ── OPTIMIZATION 3: Smart CF cache key includes Range ────────────────────────
-  // Without this, CF caches the full file under one key and can't serve chunks
-  // With this, each byte range gets its own cache entry = instant seek
   const isVideo = isVideoMimeType(mimeType);
   const response = await fetch(downloadUrl, {
     method: 'GET',
@@ -193,7 +187,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     cf: {
       cacheTtl: isVideo ? 86400 : 3600,
       cacheEverything: isVideo,
-      // Cache key includes Range so partial responses are cached correctly
       cacheKey: rangeHeader
         ? `${downloadUrl}__${rangeHeader}`
         : downloadUrl,
@@ -223,7 +216,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
     ['Content-Range', 'Content-Length'].forEach(h => {
       if (response.headers.has(h)) finalHeaders.set(h, response.headers.get(h));
     });
-    // immutable = browser won't re-validate, saves round-trip
     finalHeaders.set('Cache-Control', 'public, max-age=86400, immutable');
     addCorsHeaders(finalHeaders);
     return new Response(response.body, { status: 206, headers: finalHeaders });
@@ -247,8 +239,6 @@ async function tryServiceAccount(request, fileId, serviceAccount, accountIndex, 
 // ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
 
 // ── OPTIMIZATION 4: In-memory private key cache ───────────────────────────────
-// crypto.subtle.importPrivateKey is CPU-expensive (~10-50ms).
-// Caching the CryptoKey object means we only pay this cost once per isolate.
 const privateKeyCache = new Map();
 
 async function importPrivateKey(pemKey) {
@@ -294,7 +284,7 @@ async function getGoogleAccessToken(serviceAccount, ctx) {
     }));
 
     const sigInput = `${header}.${claims}`;
-    const privateKey = await importPrivateKey(serviceAccount.private_key); // uses cache
+    const privateKey = await importPrivateKey(serviceAccount.private_key);
     const signature = await crypto.subtle.sign(
       { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
       privateKey,
@@ -316,7 +306,6 @@ async function getGoogleAccessToken(serviceAccount, ctx) {
     const { access_token } = await tokenResp.json();
     if (!access_token) throw new Error('No access_token in response');
 
-    // Cache token for 55 min (expires in 60 min)
     ctx.waitUntil(cache.put(cacheKey, new Response(access_token, {
       headers: { 'Cache-Control': 'max-age=3300' }
     })));
@@ -329,9 +318,6 @@ async function getGoogleAccessToken(serviceAccount, ctx) {
 }
 
 // ── OPTIMIZATION 5: Metadata CF cache ────────────────────────────────────────
-// File name/size/mimeType rarely changes. Cache it at CF edge for 10 minutes.
-// This is the biggest win for repeat requests to same file — saves a full
-// googleapis.com round-trip before every download.
 async function getCachedMetadata(fileId, serviceAccount, ctx) {
   const cache = caches.default;
   const cacheKey = new Request(`https://meta.internal/v2/${fileId}`);
@@ -341,9 +327,6 @@ async function getCachedMetadata(fileId, serviceAccount, ctx) {
     if (cached) return await cached.json();
   } catch {}
 
-  // Need a fresh token just for metadata fetch
-  // Note: this runs in parallel with getGoogleAccessToken via Promise.all above
-  // so we need a separate token fetch here. It will hit the token cache.
   const token = await getGoogleAccessToken(serviceAccount, ctx);
   if (!token) return null;
 
@@ -363,7 +346,6 @@ async function getCachedMetadata(fileId, serviceAccount, ctx) {
 
   const metadata = await metaResp.json();
 
-  // Cache for 10 minutes — fire and forget
   ctx.waitUntil(cache.put(cacheKey, new Response(JSON.stringify(metadata), {
     headers: { 'Cache-Control': 'max-age=600', 'Content-Type': 'application/json' }
   })));
@@ -382,11 +364,18 @@ async function handleM3U8Request(request, targetUrl, parsedTarget, ctx, params) 
   const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
   const workerOrigin = new URL(request.url).origin;
 
+  // When rewriting M3U8 segment URLs, forward the same headers param so
+  // each segment request also gets the custom headers applied.
+  const headersParam = params?.get('headers');
+
   content = content.split('\n').map(line => {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) return line;
     const fullUrl = trimmed.startsWith('http') ? trimmed : baseUrl + trimmed;
-    return `${workerOrigin}/?url=${encodeURIComponent(fullUrl)}`;
+    const encoded = `${workerOrigin}/?url=${encodeURIComponent(fullUrl)}`;
+    return headersParam
+      ? `${encoded}&headers=${encodeURIComponent(headersParam)}`
+      : encoded;
   }).join('\n');
 
   const headers = new Headers();
@@ -405,7 +394,6 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
 
   // ── HEAD: probe file size without downloading ────────────────────────────
   if (request.method === 'HEAD') {
-    // Try Range probe first — more reliable for getting true Content-Length
     proxyHeaders.set('Range', 'bytes=0-0');
     const resp = await fetch(targetUrl, {
       method: 'GET',
@@ -425,14 +413,11 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     });
     headers.set('Accept-Ranges', 'bytes');
     addCorsHeaders(headers);
-    // Cancel the body — we don't need it
     resp.body?.cancel();
     return new Response(null, { status: 200, headers });
   }
 
-  // ── Conditional request — return 304 if client has it cached ────────────
-  // Client sends If-None-Match (ETag) or If-Modified-Since
-  // If origin agrees, we get 304 = zero bytes transferred
+  // ── Conditional request ──────────────────────────────────────────────────
   const ifNoneMatch = request.headers.get('If-None-Match');
   const ifModifiedSince = request.headers.get('If-Modified-Since');
   if (ifNoneMatch) proxyHeaders.set('If-None-Match', ifNoneMatch);
@@ -444,21 +429,14 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
       headers: proxyHeaders,
       redirect: 'follow',
       cf: {
-        // Videos cached 24h at CF edge — second request is instant
         cacheTtl: isVideo ? 86400 : 3600,
         cacheEverything: isVideo,
-        // ── KEY: Range-aware cache key ───────────────────────────────────
-        // Without this, CF stores the full file under one key
-        // and can't serve byte-range chunks from cache.
-        // With this, each chunk (e.g. bytes=0-1048575) is its own cache entry
-        // so video seeking loads instantly on second play.
         cacheKey: rangeHeader
           ? `${targetUrl}__${rangeHeader}`
           : targetUrl,
       }
     });
 
-    // 304 Not Modified — client cache is valid, return immediately
     if (response.status === 304) {
       const h = new Headers();
       addCorsHeaders(h);
@@ -488,16 +466,11 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
 
     const finalHeaders = buildResponseHeaders(response, isVideo);
 
-    // Always set Content-Length so browser shows progress bar
     if (response.headers.has('Content-Length')) {
       finalHeaders.set('Content-Length', response.headers.get('Content-Length'));
     }
-
-    // Forward ETag + Last-Modified so browser can cache and send conditional reqs
     if (response.headers.has('ETag')) finalHeaders.set('ETag', response.headers.get('ETag'));
     if (response.headers.has('Last-Modified')) finalHeaders.set('Last-Modified', response.headers.get('Last-Modified'));
-
-    // Forward Content-Range for 206 partial responses
     if (response.status === 206 && response.headers.has('Content-Range')) {
       finalHeaders.set('Content-Range', response.headers.get('Content-Range'));
     }
@@ -505,7 +478,6 @@ async function fetchDirect(request, targetUrl, parsedTarget, ctx, params) {
     const filename = extractFilename(response, targetUrl);
     if (filename) finalHeaders.set('Content-Disposition', buildContentDisposition(filename));
 
-    // Stream body directly — no buffering, no .text()/.arrayBuffer()
     return new Response(response.body, { status: response.status, headers: finalHeaders });
 
   } catch (error) {
@@ -522,10 +494,8 @@ function buildResponseHeaders(response, isVideo) {
     headers.set('Content-Type', 'video/mp4');
   }
   if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
-  // Strip these — they break streaming and cause re-encoding
   headers.delete('Content-Encoding');
   headers.delete('Transfer-Encoding');
-  // Strip security headers that block embedding
   ['Content-Security-Policy', 'X-Frame-Options', 'Set-Cookie'].forEach(h => headers.delete(h));
   headers.set('Cache-Control', isVideo ? 'public, max-age=86400, immutable' : 'public, max-age=3600');
   return headers;
@@ -583,38 +553,82 @@ function extractFilename(response, url) {
   return null;
 }
 
+// ─── buildHeaders — supports {headers} placeholder ───────────────────────────
+// The proxy URL field accepts:
+//   https://your-worker.workers.dev/?url={url}&headers={headers}
+//
+// The app URL-encodes the headers value before substituting {headers}.
+// We support two formats in the decoded value:
+//   1. JSON object  →  {"Referer":"https://site.com","Origin":"https://site.com"}
+//   2. Pipe-delimited key:value pairs  →  Referer:https://site.com|Origin:https://site.com
+//
+// Custom headers take priority over the default Referer/Origin logic below.
+// ─────────────────────────────────────────────────────────────────────────────
 function buildHeaders(request, target, params) {
   const headers = new Headers();
+
+  // Always forward range/cache headers from the client
   ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'].forEach(h => {
     const v = request.headers.get(h);
     if (v) headers.set(h, v);
   });
+
   headers.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   headers.set('Accept', '*/*');
   headers.set('Connection', 'keep-alive');
 
-  const customReferer = params?.get('referer');
-  const customOrigin = params?.get('origin');
+  // ── Parse custom headers from the {headers} placeholder ──────────────────
+  const customHeadersRaw = params?.get('headers');
+  let hasCustomHeaders = false;
 
-  if (target.hostname.includes('drive.google.com') || target.hostname.includes('drive.usercontent.google.com')) {
-    headers.set('Referer', customReferer || 'https://drive.google.com/');
-    headers.set('Origin', customOrigin || 'https://drive.google.com');
-  } else {
-    headers.set('Referer', customReferer || `${target.origin}/`);
+  if (customHeadersRaw) {
+    try {
+      const decoded = decodeURIComponent(customHeadersRaw);
+
+      // Try JSON first: {"Header-Name":"value", ...}
+      let parsed = null;
+      try {
+        parsed = JSON.parse(decoded);
+      } catch {
+        // Not JSON — try pipe-delimited: Key:Value|Key2:Value2
+        parsed = {};
+        decoded.split('|').forEach(pair => {
+          const idx = pair.indexOf(':');
+          if (idx > 0) {
+            const key = pair.slice(0, idx).trim();
+            const val = pair.slice(idx + 1).trim();
+            if (key) parsed[key] = val;
+          }
+        });
+      }
+
+      if (parsed && typeof parsed === 'object') {
+        Object.entries(parsed).forEach(([k, v]) => {
+          if (k && v) {
+            headers.set(k, String(v));
+            hasCustomHeaders = true;
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to parse headers param:', e.message);
+    }
   }
-  return headers;
-}
+  // ─────────────────────────────────────────────────────────────────────────
 
-function buildResponseHeaders(response, isVideo) {
-  const headers = new Headers(response.headers);
-  addCorsHeaders(headers);
-  const ct = response.headers.get('Content-Type');
-  if (isVideo && (!ct || ct === 'application/octet-stream')) headers.set('Content-Type', 'video/mp4');
-  if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
-  headers.delete('Content-Encoding');
-  headers.delete('Transfer-Encoding');
-  headers.set('Cache-Control', isVideo ? 'public, max-age=86400, immutable' : 'public, max-age=3600');
-  ['Content-Security-Policy', 'X-Frame-Options', 'Set-Cookie'].forEach(h => headers.delete(h));
+  // Only apply default Referer/Origin if no custom headers were provided
+  if (!hasCustomHeaders) {
+    const customReferer = params?.get('referer');
+    const customOrigin = params?.get('origin');
+
+    if (target.hostname.includes('drive.google.com') || target.hostname.includes('drive.usercontent.google.com')) {
+      headers.set('Referer', customReferer || 'https://drive.google.com/');
+      headers.set('Origin', customOrigin || 'https://drive.google.com');
+    } else {
+      headers.set('Referer', customReferer || `${target.origin}/`);
+    }
+  }
+
   return headers;
 }
 
